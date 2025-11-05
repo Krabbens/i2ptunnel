@@ -124,14 +124,68 @@ impl RequestHandler {
             };
 
             // Create client with outproxy
-            let client = match Client::builder()
-                .proxy(
-                    reqwest::Proxy::http(&selected_proxy.proxy.url)
-                        .map_err(|e| format!("Failed to create proxy: {}", e))?
-                )
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-            {
+            // Check if the outproxy is an I2P address and what type it is
+            let is_i2p_outproxy = selected_proxy.proxy.is_i2p_proxy();
+            
+            let client = if is_i2p_outproxy {
+                // For I2P-based outproxies (HTTP/HTTPS/SOCKS), we can't connect directly to the I2P address
+                // because DNS can't resolve .i2p domains. We use the local I2P router's HTTP proxy.
+                // The router should be configured to route clearnet traffic through the selected outproxy.
+                // Note: We use the HTTP proxy (port 4444) instead of SOCKS because it's more reliable
+                // and the router handles outproxy routing through its HTTP proxy interface.
+                debug!("Using I2P router HTTP proxy for outproxy: {} (router should be configured to route clearnet through this outproxy)", 
+                       selected_proxy.proxy.url);
+                
+                reqwest::Proxy::http("http://127.0.0.1:4444")
+                    .map_err(|e| format!("Failed to create I2P proxy (is I2P router running on port 4444?): {}", e))
+                    .and_then(|i2p_proxy| {
+                        Client::builder()
+                            .proxy(i2p_proxy)
+                            .timeout(std::time::Duration::from_secs(60))
+                            .build()
+                            .map_err(|e| format!("Failed to create client: {}", e))
+                    })
+            } else {
+                // For non-I2P outproxies, use them directly based on type
+                match &selected_proxy.proxy.proxy_type {
+                    crate::proxy_manager::ProxyType::Socks => {
+                        let socks_url = format!("socks5://{}:{}", selected_proxy.proxy.host, selected_proxy.proxy.port);
+                        reqwest::Proxy::all(&socks_url)
+                            .map_err(|e| format!("Failed to create SOCKS proxy: {}", e))
+                            .and_then(|p| {
+                                Client::builder()
+                                    .proxy(p)
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()
+                                    .map_err(|e| format!("Failed to create client: {}", e))
+                            })
+                    }
+                    crate::proxy_manager::ProxyType::Https => {
+                        reqwest::Proxy::https(&selected_proxy.proxy.url)
+                            .map_err(|e| format!("Failed to create HTTPS proxy: {}", e))
+                            .and_then(|p| {
+                                Client::builder()
+                                    .proxy(p)
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()
+                                    .map_err(|e| format!("Failed to create client: {}", e))
+                            })
+                    }
+                    crate::proxy_manager::ProxyType::Http => {
+                        reqwest::Proxy::http(&selected_proxy.proxy.url)
+                            .map_err(|e| format!("Failed to create HTTP proxy: {}", e))
+                            .and_then(|p| {
+                                Client::builder()
+                                    .proxy(p)
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()
+                                    .map_err(|e| format!("Failed to create client: {}", e))
+                            })
+                    }
+                }
+            };
+            
+            let client = match client {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to create HTTP client: {}", e);

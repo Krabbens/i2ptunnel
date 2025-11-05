@@ -6,16 +6,41 @@ use url::Url;
 use regex;
 
 #[derive(Debug, Clone)]
+pub enum ProxyType {
+    Http,
+    Https,
+    Socks,
+}
+
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub host: String,
     pub port: u16,
     pub url: String,
+    pub proxy_type: ProxyType,
 }
 
 impl Proxy {
     pub fn new(host: String, port: u16) -> Self {
         let url = format!("http://{}:{}", host, port);
-        Self { host, port, url }
+        // Default to HTTPS for I2P proxies (most common)
+        let proxy_type = if port == 1080 || port == 9050 {
+            ProxyType::Socks
+        } else if port == 443 {
+            ProxyType::Https
+        } else {
+            ProxyType::Http
+        };
+        Self { host, port, url, proxy_type }
+    }
+    
+    pub fn new_with_type(host: String, port: u16, proxy_type: ProxyType) -> Self {
+        let url = match proxy_type {
+            ProxyType::Socks => format!("socks5://{}:{}", host, port),
+            ProxyType::Https => format!("https://{}:{}", host, port),
+            ProxyType::Http => format!("http://{}:{}", host, port),
+        };
+        Self { host, port, url, proxy_type }
     }
 
     pub fn from_url(url_str: &str) -> Option<Self> {
@@ -23,13 +48,24 @@ impl Proxy {
             Ok(url) => {
                 let host = url.host_str()?.to_string();
                 let port = url.port().unwrap_or(80);
-                Some(Self::new(host, port))
+                let proxy_type = if url_str.starts_with("socks5://") || port == 1080 || port == 9050 {
+                    ProxyType::Socks
+                } else if url_str.starts_with("https://") || port == 443 {
+                    ProxyType::Https
+                } else {
+                    ProxyType::Http
+                };
+                Some(Self::new_with_type(host, port, proxy_type))
             }
             Err(e) => {
                 warn!("Failed to parse proxy URL {}: {}", url_str, e);
                 None
             }
         }
+    }
+    
+    pub fn is_i2p_proxy(&self) -> bool {
+        self.host.ends_with(".i2p") || self.host.ends_with(".b32.i2p")
     }
 }
 
@@ -137,7 +173,12 @@ impl ProxyManager {
                             let key = format!("{}:{}", address, port);
                             if seen.insert(key.clone()) {
                                 debug!("Found {} proxy from table: {}:{}", proxy_type, address, port);
-                                proxies.push(Proxy::new(address, port));
+                                let pt = if proxy_type == "socks" {
+                                    ProxyType::Socks
+                                } else {
+                                    ProxyType::Https
+                                };
+                                proxies.push(Proxy::new_with_type(address, port, pt));
                             }
                         }
                     }
@@ -169,6 +210,8 @@ impl ProxyManager {
                             let key = format!("{}:{}", proxy.host, proxy.port);
                             if seen.insert(key.clone()) {
                                 debug!("Found HTTPS proxy from link: {}", key);
+                                // Ensure it's marked as HTTPS type
+                                let proxy = Proxy::new_with_type(proxy.host.clone(), proxy.port, ProxyType::Https);
                                 proxies.push(proxy);
                             }
                         }
@@ -192,7 +235,7 @@ impl ProxyManager {
                     let key = format!("{}:{}", host, port);
                     if seen.insert(key.clone()) {
                         debug!("Found HTTPS proxy from URL pattern: {}", key);
-                        proxies.push(Proxy::new(host, port));
+                        proxies.push(Proxy::new_with_type(host, port, ProxyType::Https));
                     }
                 }
             }
@@ -216,7 +259,12 @@ impl ProxyManager {
                     let key = format!("{}:{}", host, port);
                     if seen.insert(key.clone()) {
                         debug!("Found I2P proxy from pattern (port {}): {}", port, key);
-                        proxies.push(Proxy::new(host, port));
+                        let pt = if port == 1080 || port == 9050 {
+                            ProxyType::Socks
+                        } else {
+                            ProxyType::Https
+                        };
+                        proxies.push(Proxy::new_with_type(host, port, pt));
                     }
                 }
             }

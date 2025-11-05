@@ -3,7 +3,7 @@ mod proxy_selector;
 mod proxy_tester;
 mod request_handler;
 
-pub use proxy_manager::{Proxy, ProxyManager};
+pub use proxy_manager::{Proxy, ProxyManager, ProxyType};
 pub use proxy_selector::{ProxySelector, SelectedProxy};
 pub use proxy_tester::{ProxyTestResult, ProxyTester};
 pub use request_handler::{RequestConfig, RequestHandler, ResponseData};
