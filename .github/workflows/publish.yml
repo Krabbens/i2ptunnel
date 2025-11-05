@@ -1,0 +1,54 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for OIDC
+      contents: read   # Required for checking out code
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      
+      - name: Install maturin
+        run: uv tool install maturin
+      
+      - name: Set up Python
+        run: |
+          uv python install 3.12
+          uv python install 3.11
+          uv python install 3.10
+          uv python install 3.9
+          uv python install 3.8
+      
+      - name: Build wheels
+        run: |
+          uv tool run maturin build --release --find-interpreter --out dist
+      
+      - name: Build source distribution
+        run: |
+          uv tool run maturin sdist --out dist
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          trusted-publisher: true
+
