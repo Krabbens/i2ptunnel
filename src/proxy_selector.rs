@@ -3,7 +3,7 @@ use crate::proxy_tester::{ProxyTestResult, ProxyTester};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct SelectedProxy {

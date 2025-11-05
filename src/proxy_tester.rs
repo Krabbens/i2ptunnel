@@ -1,7 +1,7 @@
 use crate::proxy_manager::Proxy;
 use reqwest::Client;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct ProxyTestResult {
@@ -104,7 +104,7 @@ impl ProxyTester {
 
         // Measure latency with HEAD request
         let latency_start = Instant::now();
-        let latency_result = client.head(&self.test_url).send().await;
+        let _latency_result = client.head(&self.test_url).send().await;
         let latency = latency_start.elapsed().as_secs_f64() * 1000.0;
 
         // Measure download speed with GET request

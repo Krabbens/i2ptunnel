@@ -125,7 +125,7 @@ impl I2PProxyDaemon {
 
         // Convert headers
         if let Some(headers_dict) = headers {
-            Python::with_gil(|py| {
+            Python::with_gil(|_py| {
                 let mut headers_map = std::collections::HashMap::new();
                 for (key, value) in headers_dict {
                     if let (Ok(k), Ok(v)) = (

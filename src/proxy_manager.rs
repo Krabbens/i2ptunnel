@@ -40,8 +40,35 @@ pub struct ProxyManager {
 impl ProxyManager {
     pub fn new() -> Self {
         info!("Initializing ProxyManager");
+        
+        // Use I2P HTTP proxy to access .i2p domains
+        // Default I2P HTTP proxy ports: 4444 (HTTP) or 4447 (HTTPS)
+        let i2p_proxy_http = reqwest::Proxy::http("http://127.0.0.1:4444")
+            .unwrap_or_else(|_| {
+                warn!("Failed to set I2P HTTP proxy on port 4444, trying alternative port");
+                reqwest::Proxy::http("http://127.0.0.1:4447")
+                    .unwrap_or_else(|_| {
+                        error!("Failed to set I2P proxy on both ports 4444 and 4447");
+                        panic!("Cannot initialize ProxyManager without I2P proxy");
+                    })
+            });
+        
+        // Also set HTTPS proxy for HTTPS I2P sites
+        let i2p_proxy_https = reqwest::Proxy::https("http://127.0.0.1:4447")
+            .unwrap_or_else(|_| {
+                warn!("Failed to set I2P HTTPS proxy on port 4447, using HTTP proxy port");
+                reqwest::Proxy::https("http://127.0.0.1:4444")
+                    .unwrap_or_else(|_| {
+                        warn!("Failed to set I2P HTTPS proxy, continuing without it");
+                        // Create a dummy proxy that will fail gracefully
+                        reqwest::Proxy::http("http://127.0.0.1:4444").unwrap()
+                    })
+            });
+        
         Self {
             client: Client::builder()
+                .proxy(i2p_proxy_http)
+                .proxy(i2p_proxy_https)
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("Failed to create HTTP client"),
@@ -49,9 +76,9 @@ impl ProxyManager {
     }
 
     pub async fn fetch_proxies(&self) -> Result<Vec<Proxy>, Box<dyn std::error::Error>> {
-        info!("Fetching proxy list from http://outproxys.i2p/");
+        info!("Fetching proxy list from I2P proxy address");
         
-        let url = "http://outproxys.i2p/";
+        let url = "http://proxygwdhg5z7mn326hfqqzsbnkrbzea4xrss2v7exrjx4c65uka.b32.i2p/";
         debug!("Making request to {}", url);
 
         let response = self
@@ -87,25 +114,46 @@ impl ProxyManager {
         // Parse HTML
         let document = Html::parse_document(html);
         
+        // Pattern 0: Parse HTML table structure (primary method for outproxys.i2p)
+        // The table has rows with: <td>address</td><td>port</td><td>uptime</td><td>type</td>
+        let row_selector = Selector::parse("table tr").unwrap_or_else(|_| {
+            warn!("Failed to create table row selector");
+            Selector::parse("tr").unwrap()
+        });
+        
+        for row in document.select(&row_selector) {
+            let cells: Vec<_> = row.select(&Selector::parse("td").unwrap()).collect();
+            if cells.len() >= 4 {
+                // Extract address (first cell), port (second cell), and type (fourth cell)
+                let address = cells[0].text().collect::<String>().trim().to_string();
+                let port_str = cells[1].text().collect::<String>().trim().to_string();
+                let proxy_type = cells[3].text().collect::<String>().trim().to_lowercase();
+                
+                // Only include HTTPS and SOCKS proxies, exclude HTTP
+                if proxy_type == "https" || proxy_type == "socks" {
+                    // Check if address is a valid I2P domain
+                    if address.ends_with(".i2p") || address.ends_with(".b32.i2p") {
+                        if let Ok(port) = port_str.parse::<u16>() {
+                            let key = format!("{}:{}", address, port);
+                            if seen.insert(key.clone()) {
+                                debug!("Found {} proxy from table: {}:{}", proxy_type, address, port);
+                                proxies.push(Proxy::new(address, port));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         // Try to find proxy addresses in various formats
         // Common patterns: host:port, http://host:port, etc.
         let text = document.root_element().text().collect::<String>();
         
-        // Pattern 1: Look for host:port patterns
-        let host_port_pattern = regex::Regex::new(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{2,5})")?;
-        for cap in host_port_pattern.captures_iter(&text) {
-            let host = cap[1].to_string();
-            let port: u16 = cap[2].parse().unwrap_or(0);
-            if port > 0 && port < 65536 {
-                let key = format!("{}:{}", host, port);
-                if seen.insert(key.clone()) {
-                    debug!("Found proxy: {}", key);
-                    proxies.push(Proxy::new(host, port));
-                }
-            }
-        }
+        // Pattern 1: Look for host:port patterns (IPv4 addresses)
+        // Skip this pattern as it's for clearnet proxies, not I2P proxies
+        // We only want I2P proxies (which are in .i2p or .b32.i2p domains)
 
-        // Pattern 2: Look for URLs in links
+        // Pattern 2: Look for URLs in links (only HTTPS)
         let link_selector = Selector::parse("a[href]").unwrap_or_else(|_| {
             warn!("Failed to create link selector");
             Selector::parse("a").unwrap()
@@ -113,35 +161,46 @@ impl ProxyManager {
 
         for element in document.select(&link_selector) {
             if let Some(href) = element.value().attr("href") {
-                if let Some(proxy) = Proxy::from_url(href) {
-                    let key = format!("{}:{}", proxy.host, proxy.port);
-                    if seen.insert(key.clone()) {
-                        debug!("Found proxy from link: {}", key);
-                        proxies.push(proxy);
+                // Only process HTTPS URLs
+                if href.starts_with("https://") {
+                    if let Some(proxy) = Proxy::from_url(href) {
+                        // Only include I2P domains
+                        if proxy.host.ends_with(".i2p") || proxy.host.ends_with(".b32.i2p") {
+                            let key = format!("{}:{}", proxy.host, proxy.port);
+                            if seen.insert(key.clone()) {
+                                debug!("Found HTTPS proxy from link: {}", key);
+                                proxies.push(proxy);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Pattern 3: Look for text content that might be proxy addresses
-        let url_pattern = regex::Regex::new(r"https?://([^/\s:]+):?(\d{2,5})?")?;
+        // Pattern 3: Look for HTTPS URLs (skip HTTP URLs)
+        let url_pattern = regex::Regex::new(r"https://([^/\s:]+):?(\d{2,5})?")?;
         for cap in url_pattern.captures_iter(&text) {
             if let Some(host) = cap.get(1) {
                 let host = host.as_str().to_string();
-                let port: u16 = cap
-                    .get(2)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(4444); // Default I2P outproxy port
+                // Only process I2P domains
+                if host.ends_with(".i2p") || host.ends_with(".b32.i2p") {
+                    let port: u16 = cap
+                        .get(2)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(443); // Default HTTPS port
 
-                let key = format!("{}:{}", host, port);
-                if seen.insert(key.clone()) {
-                    debug!("Found proxy from URL pattern: {}", key);
-                    proxies.push(Proxy::new(host, port));
+                    let key = format!("{}:{}", host, port);
+                    if seen.insert(key.clone()) {
+                        debug!("Found HTTPS proxy from URL pattern: {}", key);
+                        proxies.push(Proxy::new(host, port));
+                    }
                 }
             }
         }
 
-        // Pattern 4: Look for .i2p domains
+        // Pattern 4: Look for .i2p domains with common HTTPS/SOCKS ports
+        // This is a fallback pattern, but we prefer table parsing which has type information
+        // Only include ports that are commonly used for HTTPS (443) or SOCKS (1080, 9050)
         let i2p_pattern = regex::Regex::new(r"([a-z0-9-]+\.i2p)(?::(\d{2,5}))?")?;
         for cap in i2p_pattern.captures_iter(&text) {
             if let Some(host) = cap.get(1) {
@@ -149,12 +208,16 @@ impl ProxyManager {
                 let port: u16 = cap
                     .get(2)
                     .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(4444);
-
-                let key = format!("{}:{}", host, port);
-                if seen.insert(key.clone()) {
-                    debug!("Found I2P proxy: {}", key);
-                    proxies.push(Proxy::new(host, port));
+                    .unwrap_or(0);
+                
+                // Only include common HTTPS/SOCKS ports: 443 (HTTPS), 1080 (SOCKS), 9050 (SOCKS/Tor)
+                // Skip default ports that are typically HTTP (80, 4444, 8080)
+                if port == 443 || port == 1080 || port == 9050 {
+                    let key = format!("{}:{}", host, port);
+                    if seen.insert(key.clone()) {
+                        debug!("Found I2P proxy from pattern (port {}): {}", port, key);
+                        proxies.push(Proxy::new(host, port));
+                    }
                 }
             }
         }

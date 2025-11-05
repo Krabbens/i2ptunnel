@@ -2,6 +2,11 @@
 name = "i2ptunnel"
 version = "0.1.0"
 edition = "2021"
+description = "I2P Proxy Tunnel with Python decorator support"
+license = "MIT"
+repository = "https://github.com/Krabbens/i2ptunnel"
+homepage = "https://github.com/Krabbens/i2ptunnel"
+documentation = "https://github.com/Krabbens/i2ptunnel#readme"
 
 [lib]
 name = "i2ptunnel"
