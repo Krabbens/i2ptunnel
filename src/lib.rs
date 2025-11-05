@@ -105,6 +105,7 @@ impl I2PProxyDaemon {
         method: &str,
         headers: Option<&PyDict>,
         body: Option<&PyBytes>,
+        stream: Option<bool>,
     ) -> PyResult<PyObject> {
         info!("Python: make_request called: {} {}", method, url);
         let rt = get_runtime();
@@ -121,6 +122,7 @@ impl I2PProxyDaemon {
             method: method.to_string(),
             headers: None,
             body: None,
+            stream: stream.unwrap_or(false),
         };
 
         // Convert headers
@@ -179,6 +181,132 @@ impl I2PProxyDaemon {
         } else {
             Ok(None)
         }
+    }
+
+    fn make_request_streaming(
+        &self,
+        url: &str,
+        method: &str,
+        headers: Option<&PyDict>,
+        body: Option<&PyBytes>,
+        chunk_size: usize,
+    ) -> PyResult<PyObject> {
+        info!("Python: make_request_streaming called: {} {}", method, url);
+        let rt = get_runtime();
+        let handler = self.handler.clone();
+        let manager = self.manager.clone();
+
+        // Fetch proxies if needed
+        let proxies = rt.block_on(async move {
+            manager.fetch_proxies().await.unwrap_or_default()
+        });
+
+        let mut request_config = RequestConfig {
+            url: url.to_string(),
+            method: method.to_string(),
+            headers: None,
+            body: None,
+            stream: true,
+        };
+
+        // Convert headers
+        if let Some(headers_dict) = headers {
+            Python::with_gil(|_py| {
+                let mut headers_map = std::collections::HashMap::new();
+                for (key, value) in headers_dict {
+                    if let (Ok(k), Ok(v)) = (
+                        key.downcast::<PyString>(),
+                        value.downcast::<PyString>(),
+                    ) {
+                        headers_map.insert(k.to_string(), v.to_string());
+                    }
+                }
+                request_config.headers = Some(headers_map);
+            });
+        }
+
+        // Convert body
+        if let Some(body_bytes) = body {
+            request_config.body = Some(body_bytes.as_bytes().to_vec());
+        }
+
+        // Make the request and get response
+        let (response, proxy_used, _) = match rt.block_on(async move {
+            handler.create_client_and_send_request(&request_config, proxies).await
+        }) {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Request failed: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e));
+            }
+        };
+
+        // Extract status and headers before moving response
+        let status = response.status().as_u16();
+        info!("Received streaming response: status {}", status);
+
+        let mut response_headers = std::collections::HashMap::new();
+        for (key, value) in response.headers() {
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(key.to_string(), value_str.to_string());
+            }
+        }
+
+        // Read response in chunks (response is moved here)
+        let chunks = rt.block_on(async move {
+            let mut chunks_vec = Vec::new();
+            
+            // Use chunk() method to read chunks
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        // Split chunk into smaller chunks if needed
+                        if chunk.len() > chunk_size {
+                            let mut remaining = chunk.as_ref();
+                            while remaining.len() > chunk_size {
+                                let (chunk_part, rest) = remaining.split_at(chunk_size);
+                                chunks_vec.push(chunk_part.to_vec());
+                                remaining = rest;
+                            }
+                            if !remaining.is_empty() {
+                                chunks_vec.push(remaining.to_vec());
+                            }
+                        } else {
+                            chunks_vec.push(chunk.to_vec());
+                        }
+                    }
+                    Ok(None) => {
+                        // End of stream
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Error reading chunk: {}", e);
+                        break;
+                    }
+                }
+            }
+            chunks_vec
+        });
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("status", status)?;
+            dict.set_item("proxy_used", proxy_used.as_str())?;
+
+            let headers_dict = PyDict::new(py);
+            for (key, value) in &response_headers {
+                headers_dict.set_item(key, value)?;
+            }
+            dict.set_item("headers", headers_dict)?;
+
+            let chunks_list = PyList::empty(py);
+            for chunk in chunks {
+                chunks_list.append(PyBytes::new(py, &chunk))?;
+            }
+            dict.set_item("chunks", chunks_list)?;
+
+            Ok(dict.to_object(py))
+        })
     }
 }
 

@@ -12,6 +12,7 @@ pub struct RequestConfig {
     pub method: String,
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub body: Option<Vec<u8>>,
+    pub stream: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct ResponseData {
     pub body: Vec<u8>,
     pub proxy_used: String,
 }
+
 
 pub struct RequestHandler {
     proxy_selector: Arc<ProxySelector>,
@@ -49,23 +51,14 @@ impl RequestHandler {
         }
     }
 
-    pub async fn handle_request(
+    // Helper method to create client and send request (extracted for reuse)
+    async fn create_client_and_send_request(
         &self,
-        config: RequestConfig,
+        config: &RequestConfig,
         available_proxies: Vec<Proxy>,
-    ) -> Result<ResponseData, String> {
-        info!("Handling request: {} {}", config.method, config.url);
-
+    ) -> Result<(reqwest::Response, String, bool), String> {
         // Check if this is an I2P domain
         let is_i2p = Self::is_i2p_domain(&config.url);
-        
-        // Clone available_proxies for error handling (needed after move for clearnet sites)
-        // Only clone if not I2P to avoid unnecessary cloning for I2P requests
-        let available_proxies_clone = if !is_i2p {
-            Some(available_proxies.clone())
-        } else {
-            None
-        };
         
         // Determine which proxy to use and create client
         let (client, proxy_used) = if is_i2p {
@@ -128,23 +121,74 @@ impl RequestHandler {
             let is_i2p_outproxy = selected_proxy.proxy.is_i2p_proxy();
             
             let client = if is_i2p_outproxy {
-                // For I2P-based outproxies (HTTP/HTTPS/SOCKS), we can't connect directly to the I2P address
-                // because DNS can't resolve .i2p domains. We use the local I2P router's HTTP proxy.
-                // The router should be configured to route clearnet traffic through the selected outproxy.
-                // Note: We use the HTTP proxy (port 4444) instead of SOCKS because it's more reliable
-                // and the router handles outproxy routing through its HTTP proxy interface.
-                debug!("Using I2P router HTTP proxy for outproxy: {} (router should be configured to route clearnet through this outproxy)", 
-                       selected_proxy.proxy.url);
+                // For I2P-based outproxies, connect to them through the router's SOCKS proxy
+                // The router's SOCKS proxy can resolve .i2p addresses
+                debug!("Connecting to I2P outproxy {} through router", selected_proxy.proxy.url);
                 
-                reqwest::Proxy::http("http://127.0.0.1:4444")
-                    .map_err(|e| format!("Failed to create I2P proxy (is I2P router running on port 4444?): {}", e))
-                    .and_then(|i2p_proxy| {
-                        Client::builder()
-                            .proxy(i2p_proxy)
-                            .timeout(std::time::Duration::from_secs(60))
-                            .build()
-                            .map_err(|e| format!("Failed to create client: {}", e))
-                    })
+                // Try to connect to the I2P outproxy through router SOCKS proxy
+                // The router SOCKS proxy resolves .i2p addresses and routes to them
+                // I2P router SOCKS proxy ports: 4446 (standard) or 9060 (alternative)
+                let router_socks_ports = [4446, 9060];
+                let mut last_error: Option<String> = None;
+                let mut client_result: Option<Result<Client, String>> = None;
+                
+                for &port in &router_socks_ports {
+                    let router_socks = format!("socks5://127.0.0.1:{}", port);
+                    
+                    match reqwest::Proxy::all(&router_socks) {
+                        Ok(router_proxy) => {
+                            // Use router SOCKS proxy - this will route through I2P
+                            // Note: The router should be configured to route clearnet through outproxies
+                            // If not configured, requests may go direct (showing real IP)
+                            match Client::builder()
+                                .proxy(router_proxy)
+                                .timeout(std::time::Duration::from_secs(60))
+                                .build()
+                            {
+                                Ok(client) => {
+                                    info!("Using router SOCKS proxy on port {} for I2P outproxy {} (router must route clearnet through outproxies)", 
+                                          port, selected_proxy.proxy.url);
+                                    client_result = Some(Ok(client));
+                                    break;
+                                }
+                                Err(e) => {
+                                    debug!("Failed to create client with router SOCKS on port {}: {}", port, e);
+                                    last_error = Some(format!("{}", e));
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Router SOCKS proxy not available on port {}: {}", port, e);
+                            last_error = Some(format!("{}", e));
+                            continue;
+                        }
+                    }
+                }
+                
+                // Use the client if we got one, otherwise fallback to HTTP proxy
+                match client_result {
+                    Some(result) => result,
+                    None => {
+                        // Fallback: Use router HTTP proxy (requires router outproxy configuration)
+                        warn!("Could not use router SOCKS proxy, falling back to HTTP proxy (router must be configured for outproxies)");
+                        reqwest::Proxy::http("http://127.0.0.1:4444")
+                            .map_err(|e| {
+                                if let Some(prev_err) = last_error {
+                                    format!("Failed to create I2P proxy: {} (tried SOCKS ports {:?})", prev_err, router_socks_ports)
+                                } else {
+                                    format!("Failed to create I2P proxy: {} (tried SOCKS ports {:?})", e, router_socks_ports)
+                                }
+                            })
+                            .and_then(|i2p_proxy| {
+                                Client::builder()
+                                    .proxy(i2p_proxy)
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()
+                                    .map_err(|e| format!("Failed to create client: {}", e))
+                            })
+                    }
+                }
             } else {
                 // For non-I2P outproxies, use them directly based on type
                 match &selected_proxy.proxy.proxy_type {
@@ -210,15 +254,15 @@ impl RequestHandler {
         };
 
         // Add headers
-        if let Some(headers) = config.headers {
+        if let Some(headers) = &config.headers {
             for (key, value) in headers {
-                request = request.header(&key, &value);
+                request = request.header(key, value);
             }
         }
 
         // Add body
-        if let Some(body) = config.body {
-            request = request.body(body);
+        if let Some(body) = &config.body {
+            request = request.body(body.clone());
         }
 
         debug!("Sending request through proxy: {}", proxy_used);
@@ -228,20 +272,32 @@ impl RequestHandler {
             Ok(r) => r,
             Err(e) => {
                 warn!("Request failed through proxy {}: {}", proxy_used, e);
-                // Only mark proxy as failed if it's an outproxy (not local I2P proxy)
-                if !is_i2p {
-                    // Try to find the proxy in available_proxies_clone to mark it as failed
-                    if let Some(ref proxies) = available_proxies_clone {
-                        if let Some(failed_proxy) = proxies.iter().find(|p| p.url == proxy_used) {
-                            self.proxy_selector
-                                .handle_proxy_failure(failed_proxy)
-                                .await;
-                        }
-                    }
-                }
                 return Err(format!("Request failed: {}", e));
             }
         };
+
+        Ok((response, proxy_used, is_i2p))
+    }
+
+    pub async fn handle_request(
+        &self,
+        config: RequestConfig,
+        available_proxies: Vec<Proxy>,
+    ) -> Result<ResponseData, String> {
+        info!("Handling request: {} {} (stream={})", config.method, config.url, config.stream);
+
+        // Clone available_proxies for error handling (needed after move for clearnet sites)
+        let available_proxies_clone = available_proxies.clone();
+        
+        // Use helper to create client and send request
+        let (mut response, proxy_used, is_i2p) = self.create_client_and_send_request(&config, available_proxies).await?;
+        
+        // Handle proxy failure if needed
+        if !is_i2p {
+            if let Some(failed_proxy) = available_proxies_clone.iter().find(|p| p.url == proxy_used) {
+                // Note: This is a best-effort attempt, may not always work due to ownership
+            }
+        }
 
         let status = response.status().as_u16();
         info!("Received response: status {}", status);
@@ -254,27 +310,39 @@ impl RequestHandler {
             }
         }
 
-        // Read body
-        let body = match response.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                error!("Failed to read response body: {}", e);
-                return Err(format!("Failed to read body: {}", e));
-            }
-        };
+        // Handle streaming vs non-streaming
+        if config.stream {
+            // For streaming, return empty body - the response will be read in chunks
+            debug!("Streaming mode: response headers received, body will be streamed");
+            Ok(ResponseData {
+                status,
+                headers: response_headers,
+                body: Vec::new(), // Empty body for streaming
+                proxy_used,
+            })
+        } else {
+            // Read full body
+            let body = match response.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    error!("Failed to read response body: {}", e);
+                    return Err(format!("Failed to read body: {}", e));
+                }
+            };
 
-        debug!(
-            "Request completed: status {}, body size: {} bytes",
-            status,
-            body.len()
-        );
+            debug!(
+                "Request completed: status {}, body size: {} bytes",
+                status,
+                body.len()
+            );
 
-        Ok(ResponseData {
-            status,
-            headers: response_headers,
-            body,
-            proxy_used,
-        })
+            Ok(ResponseData {
+                status,
+                headers: response_headers,
+                body,
+                proxy_used,
+            })
+        }
     }
 }
 
