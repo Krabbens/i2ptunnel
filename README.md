@@ -4,6 +4,7 @@ A Rust daemon with extensive logging that manages I2P HTTPS proxies, tests them 
 
 ## Features
 
+- **Embedded i2pd Router**: Uses i2pd library directly (no external router required)
 - Fetches proxy list from `http://outproxys.i2p/`
 - Tests proxies in parallel for download speed
 - Automatically selects and uses the fastest proxy
@@ -19,6 +20,46 @@ A Rust daemon with extensive logging that manages I2P HTTPS proxies, tests them 
 - Rust (latest stable version)
 - Python 3.8+
 - uv (fast Python package installer)
+- **System Dependencies** (required for building i2pd):
+  - **CMake** (3.7 or later)
+  - **C++ Compiler** with C++17 support:
+    - Windows: MSVC or MinGW-w64
+    - Linux: GCC 8+ or Clang 8+
+    - macOS: Clang (Xcode Command Line Tools)
+  - **OpenSSL** development libraries
+  - **Boost** (1.46 or later) with components:
+    - filesystem
+    - program_options
+  - **zlib** development libraries
+  - **pthread** (usually included)
+
+#### Installing System Dependencies
+
+**Windows:**
+- Install [vcpkg](https://github.com/Microsoft/vcpkg) and install: `vcpkg install openssl boost zlib`
+- Or use pre-built binaries from [OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) and [Boost](https://www.boost.org/users/download/)
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt-get install build-essential cmake libssl-dev libboost-filesystem-dev libboost-program-options-dev zlib1g-dev
+```
+
+**Linux (Fedora/RHEL):**
+```bash
+sudo dnf install gcc-c++ cmake openssl-devel boost-devel zlib-devel
+```
+
+**macOS:**
+```bash
+brew install cmake openssl boost zlib
+```
+
+### Initial Setup
+
+First, initialize the i2pd git submodule:
+```bash
+git submodule update --init --recursive
+```
 
 Install uv:
 ```bash
@@ -132,6 +173,7 @@ export RUST_LOG=i2ptunnel=trace
 
 ## Architecture
 
+- **I2PDRouter**: Embedded i2pd router wrapper that manages the I2P router lifecycle
 - **ProxyManager**: Fetches and parses proxy list from `http://outproxys.i2p/`
 - **ProxyTester**: Tests proxies in parallel, measuring download speed and latency
 - **ProxySelector**: Tracks and selects the fastest proxy, handles failures
@@ -141,11 +183,45 @@ export RUST_LOG=i2ptunnel=trace
 ## Configuration
 
 The daemon automatically:
+- Initializes and starts an embedded i2pd router on first use
+- Provides HTTP proxy on port 4444 and HTTPS proxy on port 4447
 - Fetches proxies from the I2P outproxy list
 - Tests proxies in parallel (up to 10 concurrent tests)
 - Selects the fastest proxy based on download speed
 - Re-tests proxies every 5 minutes (configurable)
 - Rotates to a new proxy on failure
+
+## i2pd Integration
+
+This project integrates i2pd as a git submodule and compiles it as a static library. The i2pd router is embedded directly into the application, eliminating the need for an external I2P router installation.
+
+### Building with i2pd
+
+The build process:
+1. Compiles i2pd libraries (libi2pd, libi2pdclient, libi2pdlang) using CMake
+2. Compiles a C++ wrapper that exposes HTTP proxy functionality
+3. Generates Rust FFI bindings using bindgen
+4. Links everything together into the final binary
+
+### Troubleshooting Build Issues
+
+**CMake not found:**
+- Install CMake from https://cmake.org/download/
+
+**OpenSSL not found:**
+- Ensure OpenSSL development headers are installed
+- On Windows, set `OPENSSL_DIR` environment variable to OpenSSL installation
+
+**Boost not found:**
+- Ensure Boost development libraries are installed
+- On Windows, set `BOOST_ROOT` environment variable
+
+**C++17 not supported:**
+- Upgrade your compiler (GCC 8+, Clang 8+, MSVC 2017+)
+
+**Link errors:**
+- Ensure all system libraries are in your library path
+- On Linux, you may need to install `libssl-dev`, `libboost-all-dev`, `zlib1g-dev`
 
 ## Development
 

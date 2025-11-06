@@ -1,10 +1,54 @@
 use crate::proxy_manager::Proxy;
 use crate::proxy_selector::{ProxySelector, SelectedProxy};
+use crate::i2pd_router::ensure_router_running;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+/// Format an error with full details including error chain and debug information
+fn format_error_full(err: &dyn std::error::Error) -> String {
+    let mut error_parts = Vec::new();
+    
+    // Main error message
+    error_parts.push(format!("Error: {}", err));
+    
+    // Error source chain
+    let mut source = err.source();
+    if source.is_some() {
+        error_parts.push("Source chain:".to_string());
+        let mut depth = 0;
+        while let Some(src) = source {
+            depth += 1;
+            error_parts.push(format!("  {}: {}", depth, src));
+            source = src.source();
+        }
+    }
+    
+    // Debug representation
+    error_parts.push(format!("Debug: {:#?}", err));
+    
+    error_parts.join("\n")
+}
+
+/// Log error with full details, splitting long messages to avoid truncation
+fn log_error_full(prefix: &str, err: &dyn std::error::Error) {
+    // Log the main error message first
+    error!("{} Error: {}", prefix, err);
+    
+    // Log error source chain
+    let mut source = err.source();
+    let mut depth = 0;
+    while let Some(src) = source {
+        depth += 1;
+        error!("{} Source {}: {}", prefix, depth, src);
+        source = src.source();
+    }
+    
+    // Log the debug representation (this gives full error details)
+    error!("{} Error debug: {:#?}", prefix, err);
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestConfig {
@@ -63,95 +107,194 @@ impl RequestHandler {
             || error_lower.contains("proxy server unreachable")
     }
 
-    /// Verify router SOCKS proxy is reachable by attempting to create a client
+    /// Verify router SOCKS proxy is reachable by attempting to connect
     async fn verify_router_socks_available(port: u16) -> bool {
-        let router_socks = format!("socks5://127.0.0.1:{}", port);
-        match reqwest::Proxy::all(&router_socks) {
-            Ok(_) => {
-                debug!("Router SOCKS proxy on port {} appears to be available", port);
+        use std::time::Duration;
+        
+        // Try to actually connect to the port
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        ).await {
+            Ok(Ok(_)) => {
+                debug!("Router SOCKS proxy on port {} is reachable", port);
                 true
             }
-            Err(e) => {
-                debug!("Router SOCKS proxy on port {} not available: {}", port, e);
+            Ok(Err(e)) => {
+                debug!("Router SOCKS proxy on port {} not reachable: {}", port, e);
+                false
+            }
+            Err(_) => {
+                debug!("Router SOCKS proxy on port {} connection timeout", port);
                 false
             }
         }
     }
 
-    /// Create a client from a proxy candidate
+    /// Create a client from a proxy candidate with optional router port hint
     async fn create_client_from_proxy(
         &self,
         selected_proxy: &SelectedProxy,
+        router_port_hint: Option<u16>,
     ) -> Result<(Client, String), String> {
         let is_i2p_outproxy = selected_proxy.proxy.is_i2p_proxy();
         
         let client = if is_i2p_outproxy {
-            // For I2P-based outproxies, connect to them through the router's SOCKS proxy
-            debug!("Connecting to I2P outproxy {} through router", selected_proxy.proxy.url);
+            // Ensure i2pd router is running for I2P outproxies
+            if let Err(e) = ensure_router_running() {
+                return Err(format!("Failed to ensure i2pd router is running: {}", e));
+            }
             
-            // Verify router SOCKS proxies are available before trying
-            let router_socks_ports = [4446, 9060];
-            let mut available_port: Option<u16> = None;
+            // For I2P-based outproxies, connect to them through the router's HTTP/HTTPS proxy
+            // SOCKS5 cannot handle .b32.i2p addresses, so we skip SOCKS5 entirely
+            debug!("Connecting to I2P outproxy {} through router (HTTP/HTTPS only, no SOCKS5)", selected_proxy.proxy.url);
             
-            for &port in &router_socks_ports {
-                if Self::verify_router_socks_available(port).await {
-                    available_port = Some(port);
-                    break;
+            // If router port hint is provided (for parallel downloads), use it
+            if let Some(port) = router_port_hint {
+                // Try HTTP or HTTPS based on port hint
+                if port == 4444 {
+                    // HTTP proxy
+                    match reqwest::Proxy::http("http://127.0.0.1:4444") {
+                        Ok(i2p_proxy) => {
+                            match Client::builder()
+                                .proxy(i2p_proxy)
+                                .timeout(std::time::Duration::from_secs(300))
+                                .build()
+                            {
+                                Ok(client) => {
+                                    info!("Using router HTTP proxy on port 4444 for I2P outproxy {} (parallel download)", selected_proxy.proxy.url);
+                                    return Ok((client, format!("router-http://127.0.0.1:4444 (for {})", selected_proxy.proxy.url)));
+                                }
+                                Err(e) => return Err(format!("Failed to create HTTP client: {}", e)),
+                            }
+                        }
+                        Err(e) => return Err(format!("Failed to create HTTP proxy: {}", e)),
+                    }
+                } else if port == 4447 {
+                    // HTTPS proxy (not SOCKS5, as SOCKS5 cannot handle .b32.i2p addresses)
+                    match reqwest::Proxy::https("http://127.0.0.1:4447") {
+                        Ok(i2p_proxy) => {
+                            match Client::builder()
+                                .proxy(i2p_proxy)
+                                .timeout(std::time::Duration::from_secs(300))
+                                .build()
+                            {
+                                Ok(client) => {
+                                    info!("Using router HTTPS proxy on port 4447 for I2P outproxy {} (parallel download)", selected_proxy.proxy.url);
+                                    return Ok((client, format!("router-https://127.0.0.1:4447 (for {})", selected_proxy.proxy.url)));
+                                }
+                                Err(e) => return Err(format!("Failed to create HTTPS client: {}", e)),
+                            }
+                        }
+                        Err(e) => return Err(format!("Failed to create HTTPS proxy: {}", e)),
+                    }
                 }
             }
             
-            if let Some(port) = available_port {
-                let router_socks = format!("socks5://127.0.0.1:{}", port);
-                match reqwest::Proxy::all(&router_socks) {
-                    Ok(router_proxy) => {
-                        match Client::builder()
-                            .proxy(router_proxy)
-                            .timeout(std::time::Duration::from_secs(60))
-                            .build()
-                        {
-                            Ok(client) => {
-                                info!("Using router SOCKS proxy on port {} for I2P outproxy {} (router must route clearnet through outproxies)", 
-                                      port, selected_proxy.proxy.url);
-                                Ok((client, format!("router-socks5://127.0.0.1:{} (for {})", port, selected_proxy.proxy.url)))
-                            }
-                            Err(e) => {
-                                Err(format!("Failed to create client with router SOCKS on port {}: {}", port, e))
-                            }
+            // No router port hint: try HTTP proxy first, then HTTPS proxy
+            // HTTP proxy is better for streaming large files and can handle .b32.i2p addresses
+            match reqwest::Proxy::http("http://127.0.0.1:4444") {
+                Ok(i2p_proxy) => {
+                    match Client::builder()
+                        .proxy(i2p_proxy)
+                        .timeout(std::time::Duration::from_secs(300))  // Longer timeout for streaming
+                        .build()
+                    {
+                        Ok(client) => {
+                            info!("Using router HTTP proxy on port 4444 for I2P outproxy {} (better for streaming)", selected_proxy.proxy.url);
+                            Ok((client, format!("router-http://127.0.0.1:4444 (for {})", selected_proxy.proxy.url)))
+                        }
+                        Err(e) => {
+                            log_error_full("Failed to create client with router HTTP, falling back to HTTPS:", &e);
+                            // Fallback to HTTPS
+                            reqwest::Proxy::https("http://127.0.0.1:4447")
+                                .map_err(|e| {
+                                    log_error_full("Failed to create I2P HTTPS proxy (tried HTTP port 4444):", &e);
+                                    format!("Failed to create I2P HTTPS proxy: {} (tried HTTP port 4444)", e)
+                                })
+                                .and_then(|i2p_proxy| {
+                                    Client::builder()
+                                        .proxy(i2p_proxy)
+                                        .timeout(std::time::Duration::from_secs(300))
+                                        .build()
+                                        .map_err(|e| {
+                                            log_error_full("Failed to create HTTPS client:", &e);
+                                            format!("Failed to create HTTPS client: {}", e)
+                                        })
+                                })
+                                .map(|client| (client, format!("router-https://127.0.0.1:4447 (for {}, fallback from HTTP)", selected_proxy.proxy.url)))
                         }
                     }
-                    Err(e) => {
-                        Err(format!("Router SOCKS proxy not available on port {}: {}", port, e))
-                    }
                 }
-            } else {
-                // Fallback: Use router HTTP proxy (requires router outproxy configuration)
-                warn!("No router SOCKS proxy available (tried ports {:?}), falling back to HTTP proxy (router must be configured for outproxies)", router_socks_ports);
-                reqwest::Proxy::http("http://127.0.0.1:4444")
-                    .map_err(|e| format!("Failed to create I2P HTTP proxy: {} (tried SOCKS ports {:?})", e, router_socks_ports))
-                    .and_then(|i2p_proxy| {
-                        Client::builder()
-                            .proxy(i2p_proxy)
-                            .timeout(std::time::Duration::from_secs(60))
-                            .build()
-                            .map_err(|e| format!("Failed to create client: {}", e))
-                    })
-                    .map(|client| (client, format!("router-http://127.0.0.1:4444 (for {})", selected_proxy.proxy.url)))
+                Err(e) => {
+                    log_error_full("Router HTTP proxy not available, falling back to HTTPS:", &e);
+                    // Final fallback to HTTPS
+                    reqwest::Proxy::https("http://127.0.0.1:4447")
+                        .map_err(|e| {
+                            log_error_full("Failed to create I2P HTTPS proxy (tried HTTP port 4444):", &e);
+                            format!("Failed to create I2P HTTPS proxy: {} (tried HTTP port 4444)", e)
+                        })
+                        .and_then(|i2p_proxy| {
+                            Client::builder()
+                                .proxy(i2p_proxy)
+                                .timeout(std::time::Duration::from_secs(300))
+                                .build()
+                                .map_err(|e| {
+                                    log_error_full("Failed to create HTTPS client:", &e);
+                                    format!("Failed to create HTTPS client: {}", e)
+                                })
+                        })
+                        .map(|client| (client, format!("router-https://127.0.0.1:4447 (for {}, fallback from HTTP)", selected_proxy.proxy.url)))
+                }
             }
         } else {
             // For non-I2P outproxies, use them directly based on type
             match &selected_proxy.proxy.proxy_type {
                 crate::proxy_manager::ProxyType::Socks => {
+                    // Try SOCKS first, fallback to HTTPS if SOCKS fails
                     let socks_url = format!("socks5://{}:{}", selected_proxy.proxy.host, selected_proxy.proxy.port);
-                    reqwest::Proxy::all(&socks_url)
-                        .map_err(|e| format!("Failed to create SOCKS proxy for {}: {}", selected_proxy.proxy.url, e))
-                        .and_then(|p| {
-                            Client::builder()
-                                .proxy(p)
+                    let https_url = format!("https://{}:{}", selected_proxy.proxy.host, selected_proxy.proxy.port);
+                    
+                    // Try SOCKS first
+                    match reqwest::Proxy::all(&socks_url) {
+                        Ok(socks_proxy) => {
+                            match Client::builder()
+                                .proxy(socks_proxy)
                                 .timeout(std::time::Duration::from_secs(60))
                                 .build()
-                                .map_err(|e| format!("Failed to create client for {}: {}", selected_proxy.proxy.url, e))
-                        })
-                        .map(|client| (client, selected_proxy.proxy.url.clone()))
+                            {
+                                Ok(client) => Ok((client, selected_proxy.proxy.url.clone())),
+                                Err(e) => {
+                                    warn!("SOCKS proxy {} failed to create client, falling back to HTTPS: {}", selected_proxy.proxy.url, e);
+                                    // Fallback to HTTPS
+                                    reqwest::Proxy::https(&https_url)
+                                        .map_err(|e| format!("Failed to create HTTPS fallback proxy for {}: {}", selected_proxy.proxy.url, e))
+                                        .and_then(|p| {
+                                            Client::builder()
+                                                .proxy(p)
+                                                .timeout(std::time::Duration::from_secs(60))
+                                                .build()
+                                                .map_err(|e| format!("Failed to create HTTPS fallback client for {}: {}", selected_proxy.proxy.url, e))
+                                        })
+                                        .map(|client| (client, format!("https://{}:{} (fallback from SOCKS)", selected_proxy.proxy.host, selected_proxy.proxy.port)))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("SOCKS proxy {} not available, falling back to HTTPS: {}", selected_proxy.proxy.url, e);
+                            // Fallback to HTTPS
+                            reqwest::Proxy::https(&https_url)
+                                .map_err(|e| format!("Failed to create HTTPS fallback proxy for {}: {}", selected_proxy.proxy.url, e))
+                                .and_then(|p| {
+                                    Client::builder()
+                                        .proxy(p)
+                                        .timeout(std::time::Duration::from_secs(60))
+                                        .build()
+                                        .map_err(|e| format!("Failed to create HTTPS fallback client for {}: {}", selected_proxy.proxy.url, e))
+                                })
+                                .map(|client| (client, format!("https://{}:{} (fallback from SOCKS)", selected_proxy.proxy.host, selected_proxy.proxy.port)))
+                        }
+                    }
                 }
                 crate::proxy_manager::ProxyType::Https => {
                     reqwest::Proxy::https(&selected_proxy.proxy.url)
@@ -195,6 +338,11 @@ impl RequestHandler {
         // For I2P sites, use local I2P proxy (no retry needed)
         if is_i2p {
             info!("Detected I2P domain, using local I2P proxy");
+            
+            // Ensure i2pd router is running
+            if let Err(e) = ensure_router_running() {
+                return Err(format!("Failed to ensure i2pd router is running: {}", e));
+            }
             
             // Check if URL uses HTTPS to determine proxy port
             let is_https = config.url.starts_with("https://");
@@ -276,7 +424,7 @@ impl RequestHandler {
                   selected_proxy.speed_bytes_per_sec / 1024.0);
 
             // Create client from this proxy
-            let (client, proxy_used) = match self.create_client_from_proxy(selected_proxy).await {
+            let (client, proxy_used) = match self.create_client_from_proxy(selected_proxy, None).await {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("Failed to create client for proxy {}: {}", selected_proxy.proxy.url, e);
@@ -329,6 +477,7 @@ impl RequestHandler {
                     
                     if is_connection_error {
                         warn!("Proxy {} unreachable or connection error: {}", proxy_used, error_str);
+                        log_error_full(&format!("Full error details for proxy {}:", proxy_used), &e);
                         // Mark this proxy as failed
                         self.proxy_selector.handle_proxy_failure(&selected_proxy.proxy).await;
                         failed_proxies.push(selected_proxy);
@@ -338,7 +487,8 @@ impl RequestHandler {
                     } else {
                         // For non-connection errors (like HTTP errors), return immediately
                         // as retrying won't help
-                        warn!("Request failed through proxy {} with non-connection error: {}", proxy_used, error_str);
+                        let prefix = format!("Request failed through proxy {} with non-connection error:", proxy_used);
+                        log_error_full(&prefix, &e);
                         return Err(format!("Request failed through proxy {}: {}", proxy_used, error_str));
                     }
                 }
@@ -363,6 +513,111 @@ impl RequestHandler {
         count: usize,
     ) -> Result<Vec<SelectedProxy>, Box<dyn std::error::Error>> {
         self.proxy_selector.ensure_multiple_proxy_candidates(available_proxies, count).await
+    }
+
+    /// Handle a request using a specific proxy (for parallel downloads)
+    pub async fn handle_request_with_specific_proxy(
+        &self,
+        config: RequestConfig,
+        proxy: Proxy,
+        router_port_hint: Option<u16>,
+    ) -> Result<ResponseData, String> {
+        info!("Handling request with specific proxy: {} {} -> {}", config.method, config.url, proxy.url);
+
+        // Create a SelectedProxy from the provided proxy
+        let selected_proxy = SelectedProxy {
+            proxy: proxy.clone(),
+            speed_bytes_per_sec: 1024.0 * 50.0, // Default speed assumption
+            selected_at: std::time::Instant::now(),
+        };
+
+        // Create client from this specific proxy with optional router port hint
+        let (client, proxy_used) = match self.create_client_from_proxy(&selected_proxy, router_port_hint).await {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to create client for specific proxy {}: {}", proxy.url, e);
+                return Err(format!("Failed to create client: {}", e));
+            }
+        };
+
+        // Build request
+        let mut request = match config.method.as_str() {
+            "GET" => client.get(&config.url),
+            "POST" => client.post(&config.url),
+            "PUT" => client.put(&config.url),
+            "DELETE" => client.delete(&config.url),
+            "PATCH" => client.patch(&config.url),
+            "HEAD" => client.head(&config.url),
+            _ => {
+                return Err(format!("Unsupported HTTP method: {}", config.method));
+            }
+        };
+
+        // Add headers
+        if let Some(headers) = &config.headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+
+        // Add body
+        if let Some(body) = &config.body {
+            request = request.body(body.clone());
+        }
+
+        debug!("Sending request through specific proxy: {}", proxy_used);
+
+        // Send request
+        let response = request.send().await.map_err(|e| {
+            let prefix = format!("Request failed through proxy {}:", proxy_used);
+            log_error_full(&prefix, &e);
+            format!("Request failed through proxy {}: {}", proxy_used, e)
+        })?;
+
+        let status = response.status().as_u16();
+        info!("Received response: status {}", status);
+
+        // Extract headers
+        let mut response_headers = std::collections::HashMap::new();
+        for (key, value) in response.headers() {
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(key.to_string(), value_str.to_string());
+            }
+        }
+
+        // Handle streaming vs non-streaming
+        if config.stream {
+            // For streaming, return empty body - the response will be read in chunks
+            debug!("Streaming mode: response headers received, body will be streamed");
+            Ok(ResponseData {
+                status,
+                headers: response_headers,
+                body: Vec::new(), // Empty body for streaming
+                proxy_used,
+            })
+        } else {
+            // Read full body
+            let body = match response.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    log_error_full("Failed to read response body:", &e);
+                    return Err(format!("Failed to read body: {}", e));
+                }
+            };
+
+            debug!(
+                "Request completed: status {}, body size: {} bytes",
+                status,
+                body.len()
+            );
+
+            Ok(ResponseData {
+                status,
+                headers: response_headers,
+                body,
+                proxy_used,
+            })
+        }
     }
 
     pub async fn handle_request(
@@ -446,6 +701,176 @@ impl RequestHandler {
                 proxy_used,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_i2p_domain() {
+        // Test .i2p domains
+        assert!(RequestHandler::is_i2p_domain("http://example.i2p"));
+        assert!(RequestHandler::is_i2p_domain("https://example.i2p/path"));
+        assert!(RequestHandler::is_i2p_domain("http://site.i2p:8080"));
+        
+        // Test .b32.i2p domains
+        assert!(RequestHandler::is_i2p_domain("http://abc123.b32.i2p"));
+        assert!(RequestHandler::is_i2p_domain("https://xyz789.b32.i2p/path"));
+        
+        // Test non-I2P domains
+        assert!(!RequestHandler::is_i2p_domain("http://example.com"));
+        assert!(!RequestHandler::is_i2p_domain("https://google.com"));
+        assert!(!RequestHandler::is_i2p_domain("http://localhost:8080"));
+        
+        // Test edge cases
+        assert!(!RequestHandler::is_i2p_domain(""));
+        assert!(!RequestHandler::is_i2p_domain("i2p"));
+        assert!(!RequestHandler::is_i2p_domain("not-i2p.com"));
+    }
+
+    #[test]
+    fn test_request_config_creation() {
+        let config = RequestConfig {
+            url: "https://example.com".to_string(),
+            method: "GET".to_string(),
+            headers: None,
+            body: None,
+            stream: false,
+        };
+        
+        assert_eq!(config.url, "https://example.com");
+        assert_eq!(config.method, "GET");
+        assert!(config.headers.is_none());
+        assert!(config.body.is_none());
+        assert!(!config.stream);
+    }
+
+    #[test]
+    fn test_request_config_with_stream() {
+        let config = RequestConfig {
+            url: "https://example.com".to_string(),
+            method: "GET".to_string(),
+            headers: None,
+            body: None,
+            stream: true,
+        };
+        
+        assert!(config.stream);
+    }
+
+    #[test]
+    fn test_request_config_with_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("User-Agent".to_string(), "test".to_string());
+        
+        let config = RequestConfig {
+            url: "https://example.com".to_string(),
+            method: "GET".to_string(),
+            headers: Some(headers),
+            body: None,
+            stream: false,
+        };
+        
+        assert!(config.headers.is_some());
+        let headers = config.headers.unwrap();
+        assert_eq!(headers.get("User-Agent"), Some(&"test".to_string()));
+    }
+
+    #[test]
+    fn test_response_data_creation() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Content-Type".to_string(), "text/html".to_string());
+        
+        let response = ResponseData {
+            status: 200,
+            headers,
+            body: b"Hello World".to_vec(),
+            proxy_used: "http://proxy.i2p:443".to_string(),
+        };
+        
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers.get("Content-Type"), Some(&"text/html".to_string()));
+        assert_eq!(response.body, b"Hello World");
+        assert_eq!(response.proxy_used, "http://proxy.i2p:443");
+    }
+
+    #[test]
+    fn test_is_i2p_domain_edge_cases() {
+        // Test various edge cases
+        assert!(!RequestHandler::is_i2p_domain("http://.i2p")); // Empty host
+        assert!(!RequestHandler::is_i2p_domain("http://i2p")); // Just i2p, not .i2p
+        assert!(RequestHandler::is_i2p_domain("http://a.b32.i2p")); // Valid b32
+        assert!(RequestHandler::is_i2p_domain("https://test.i2p:8080/path?query=1")); // With port and path
+        assert!(!RequestHandler::is_i2p_domain("http://i2p.example.com")); // i2p as subdomain
+    }
+
+    #[test]
+    fn test_is_proxy_connection_error() {
+        assert!(RequestHandler::is_proxy_connection_error("Connection unreachable"));
+        assert!(RequestHandler::is_proxy_connection_error("connection refused"));
+        assert!(RequestHandler::is_proxy_connection_error("Connection timed out"));
+        assert!(RequestHandler::is_proxy_connection_error("SOCKS connect error"));
+        assert!(!RequestHandler::is_proxy_connection_error("HTTP 404 Not Found"));
+        assert!(!RequestHandler::is_proxy_connection_error("Invalid response"));
+    }
+
+    #[test]
+    fn test_request_config_all_methods() {
+        let methods = vec!["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"];
+        
+        for method in methods {
+            let config = RequestConfig {
+                url: "https://example.com".to_string(),
+                method: method.to_string(),
+                headers: None,
+                body: None,
+                stream: false,
+            };
+            assert_eq!(config.method, method);
+        }
+    }
+
+    #[test]
+    fn test_request_config_with_body() {
+        let body = b"test body data".to_vec();
+        let config = RequestConfig {
+            url: "https://example.com".to_string(),
+            method: "POST".to_string(),
+            headers: None,
+            body: Some(body.clone()),
+            stream: false,
+        };
+        
+        assert!(config.body.is_some());
+        assert_eq!(config.body.unwrap(), body);
+    }
+
+    #[test]
+    fn test_response_data_empty_body() {
+        let response = ResponseData {
+            status: 204,
+            headers: std::collections::HashMap::new(),
+            body: vec![],
+            proxy_used: "http://proxy.i2p:443".to_string(),
+        };
+        
+        assert_eq!(response.status, 204);
+        assert_eq!(response.body.len(), 0);
+    }
+
+    #[test]
+    fn test_response_data_large_body() {
+        let large_body = vec![0u8; 10000];
+        let response = ResponseData {
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            body: large_body.clone(),
+            proxy_used: "http://proxy.i2p:443".to_string(),
+        };
+        
+        assert_eq!(response.body.len(), 10000);
     }
 }
 

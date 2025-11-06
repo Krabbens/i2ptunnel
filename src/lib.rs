@@ -2,17 +2,19 @@ mod proxy_manager;
 mod proxy_selector;
 mod proxy_tester;
 mod request_handler;
+mod i2pd_router;
 
 pub use proxy_manager::{Proxy, ProxyManager, ProxyType};
 pub use proxy_selector::{ProxySelector, SelectedProxy};
 pub use proxy_tester::{ProxyTestResult, ProxyTester};
 pub use request_handler::{RequestConfig, RequestHandler, ResponseData};
+pub use i2pd_router::{I2PDRouter, ensure_router_running};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 static RUNTIME: once_cell::sync::OnceCell<Runtime> = once_cell::sync::OnceCell::new();
 
@@ -35,6 +37,12 @@ impl I2PProxyDaemon {
     #[new]
     fn new() -> PyResult<Self> {
         info!("Creating new I2PProxyDaemon instance");
+        
+        // Ensure i2pd router is running
+        if let Err(e) = ensure_router_running() {
+            warn!("Failed to ensure i2pd router is running: {}. Continuing anyway.", e);
+        }
+        
         let manager = Arc::new(ProxyManager::new());
         let selector = Arc::new(ProxySelector::new(300));
         let handler = Arc::new(RequestHandler::new(selector.clone()));
@@ -169,6 +177,7 @@ impl I2PProxyDaemon {
             }),
             Err(e) => {
                 error!("Request failed: {}", e);
+                error!("Request error details (debug): {:#?}", e);
                 Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
             }
         }
@@ -181,6 +190,194 @@ impl I2PProxyDaemon {
         } else {
             Ok(None)
         }
+    }
+
+    /// Make a request using a specific proxy URL (for parallel downloads)
+    fn make_request_with_proxy(
+        &self,
+        url: &str,
+        proxy_url: &str,
+        method: &str,
+        headers: Option<&PyDict>,
+        body: Option<&PyBytes>,
+        stream: Option<bool>,
+    ) -> PyResult<PyObject> {
+        info!("Python: make_request_with_proxy called: {} {} -> {}", method, url, proxy_url);
+        let rt = get_runtime();
+        let handler = self.handler.clone();
+
+        // Convert proxy URL to Proxy struct
+        let proxy = match Proxy::from_url(proxy_url) {
+            Some(p) => p,
+            None => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid proxy URL: {}", proxy_url)
+                ));
+            }
+        };
+
+        let mut request_config = RequestConfig {
+            url: url.to_string(),
+            method: method.to_string(),
+            headers: None,
+            body: None,
+            stream: stream.unwrap_or(false),
+        };
+
+        // Convert headers
+        if let Some(headers_dict) = headers {
+            Python::with_gil(|_py| {
+                let mut headers_map = std::collections::HashMap::new();
+                for (key, value) in headers_dict {
+                    if let (Ok(k), Ok(v)) = (
+                        key.downcast::<PyString>(),
+                        value.downcast::<PyString>(),
+                    ) {
+                        headers_map.insert(k.to_string(), v.to_string());
+                    }
+                }
+                request_config.headers = Some(headers_map);
+            });
+        }
+
+        // Convert body
+        if let Some(body_bytes) = body {
+            request_config.body = Some(body_bytes.as_bytes().to_vec());
+        }
+
+        let response = rt.block_on(async move {
+            handler.handle_request_with_specific_proxy(request_config, proxy, None).await
+        });
+
+        match response {
+            Ok(response_data) => Python::with_gil(|py| {
+                let dict = PyDict::new(py);
+                dict.set_item("status", response_data.status)?;
+                dict.set_item("proxy_used", response_data.proxy_used.as_str())?;
+
+                let headers_dict = PyDict::new(py);
+                for (key, value) in response_data.headers {
+                    headers_dict.set_item(key, value)?;
+                }
+                dict.set_item("headers", headers_dict)?;
+
+                let body_bytes = PyBytes::new(py, &response_data.body);
+                dict.set_item("body", body_bytes)?;
+
+                Ok(dict.to_object(py))
+            }),
+            Err(e) => {
+                error!("Request failed: {}", e);
+                error!("Request error details (debug): {:#?}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+            }
+        }
+    }
+
+    #[pyo3(signature = (url, proxy_url, method, *, headers=None, body=None, chunk_size=8192, router_port=None))]
+    fn make_request_streaming_with_proxy(
+        &self,
+        url: &str,
+        proxy_url: &str,
+        method: &str,
+        headers: Option<&PyDict>,
+        body: Option<&PyBytes>,
+        chunk_size: usize,
+        router_port: Option<u16>,
+    ) -> PyResult<PyObject> {
+        info!("Python: make_request_streaming_with_proxy called: {} {} -> {}", method, url, proxy_url);
+        let rt = get_runtime();
+        let handler = self.handler.clone();
+
+        // Convert proxy URL to Proxy struct
+        let proxy = match Proxy::from_url(proxy_url) {
+            Some(p) => p,
+            None => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid proxy URL: {}", proxy_url)
+                ));
+            }
+        };
+
+        let mut request_config = RequestConfig {
+            url: url.to_string(),
+            method: method.to_string(),
+            headers: None,
+            body: None,
+            stream: false,  // Read full body first, then split into chunks for streaming interface
+        };
+
+        // Convert headers
+        if let Some(headers_dict) = headers {
+            Python::with_gil(|_py| {
+                let mut headers_map = std::collections::HashMap::new();
+                for (key, value) in headers_dict {
+                    if let (Ok(k), Ok(v)) = (
+                        key.downcast::<PyString>(),
+                        value.downcast::<PyString>(),
+                    ) {
+                        headers_map.insert(k.to_string(), v.to_string());
+                    }
+                }
+                request_config.headers = Some(headers_map);
+            });
+        }
+
+        // Convert body
+        if let Some(body_bytes) = body {
+            request_config.body = Some(body_bytes.as_bytes().to_vec());
+        }
+
+        // Use handle_request_with_specific_proxy with stream=false to read full body
+        // Then split it into chunks to simulate streaming
+        let response_data = rt.block_on(async move {
+            handler.handle_request_with_specific_proxy(request_config, proxy, router_port).await
+        });
+
+        let (status, response_headers, body, proxy_used) = match response_data {
+            Ok(data) => (data.status, data.headers, data.body, data.proxy_used),
+            Err(e) => {
+                error!("Request failed: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e));
+            }
+        };
+
+        // Split body into chunks for streaming interface
+        let chunks = if body.is_empty() {
+            Vec::new()
+        } else {
+            let mut chunks_vec = Vec::new();
+            let mut remaining = body.as_slice();
+            while remaining.len() > chunk_size {
+                let (chunk_part, rest) = remaining.split_at(chunk_size);
+                chunks_vec.push(chunk_part.to_vec());
+                remaining = rest;
+            }
+            if !remaining.is_empty() {
+                chunks_vec.push(remaining.to_vec());
+            }
+            chunks_vec
+        };
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("status", status)?;
+            dict.set_item("proxy_used", proxy_used.as_str())?;
+
+            let headers_dict = PyDict::new(py);
+            for (key, value) in &response_headers {
+                headers_dict.set_item(key, value)?;
+            }
+            dict.set_item("headers", headers_dict)?;
+
+            let chunks_list = PyList::empty(py);
+            for chunk in chunks {
+                chunks_list.append(PyBytes::new(py, &chunk))?;
+            }
+            dict.set_item("chunks", chunks_list)?;
+
+            Ok(dict.to_object(py))
+        })
     }
 
     #[pyo3(signature = (url, method, *, headers=None, body=None, chunk_size=8192))]
@@ -310,6 +507,7 @@ impl I2PProxyDaemon {
                     }
                     Err(e) => {
                         error!("Error reading chunk: {}", e);
+                        error!("Chunk read error details (debug): {:#?}", e);
                         break;
                     }
                 }

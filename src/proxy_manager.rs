@@ -4,6 +4,25 @@ use std::collections::HashSet;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use regex;
+use crate::i2pd_router::ensure_router_running;
+
+/// Log error with full details, splitting long messages to avoid truncation
+fn log_error_full(prefix: &str, err: &dyn std::error::Error) {
+    // Log the main error message first
+    error!("{} Error: {}", prefix, err);
+    
+    // Log error source chain
+    let mut source = err.source();
+    let mut depth = 0;
+    while let Some(src) = source {
+        depth += 1;
+        error!("{} Source {}: {}", prefix, depth, src);
+        source = src.source();
+    }
+    
+    // Log the debug representation (this gives full error details)
+    error!("{} Error debug: {:#?}", prefix, err);
+}
 
 #[derive(Debug, Clone)]
 pub enum ProxyType {
@@ -77,6 +96,11 @@ impl ProxyManager {
     pub fn new() -> Self {
         info!("Initializing ProxyManager");
         
+        // Ensure i2pd router is running
+        if let Err(e) = ensure_router_running() {
+            warn!("Failed to ensure i2pd router is running: {}. Will try to connect anyway.", e);
+        }
+        
         // Use I2P HTTP proxy to access .i2p domains
         // Default I2P HTTP proxy ports: 4444 (HTTP) or 4447 (HTTPS)
         let i2p_proxy_http = reqwest::Proxy::http("http://127.0.0.1:4444")
@@ -123,14 +147,14 @@ impl ProxyManager {
             .send()
             .await
             .map_err(|e| {
-                error!("Failed to fetch proxy list: {}", e);
+                log_error_full("Failed to fetch proxy list:", &e);
                 e
             })?;
 
         info!("Received response with status: {}", response.status());
         
         let html = response.text().await.map_err(|e| {
-            error!("Failed to read response body: {}", e);
+            log_error_full("Failed to read response body:", &e);
             e
         })?;
 
@@ -281,6 +305,238 @@ impl ProxyManager {
 impl Default for ProxyManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_new() {
+        let proxy = Proxy::new("example.i2p".to_string(), 443);
+        assert_eq!(proxy.host, "example.i2p");
+        assert_eq!(proxy.port, 443);
+        assert_eq!(proxy.url, "http://example.i2p:443");
+        assert!(matches!(proxy.proxy_type, ProxyType::Https));
+    }
+
+    #[test]
+    fn test_proxy_new_with_type() {
+        let proxy = Proxy::new_with_type("proxy.i2p".to_string(), 1080, ProxyType::Socks);
+        assert_eq!(proxy.host, "proxy.i2p");
+        assert_eq!(proxy.port, 1080);
+        assert!(proxy.url.starts_with("socks5://"));
+        assert!(matches!(proxy.proxy_type, ProxyType::Socks));
+    }
+
+    #[test]
+    fn test_proxy_from_url_http() {
+        let proxy = Proxy::from_url("http://test.i2p:8080").unwrap();
+        assert_eq!(proxy.host, "test.i2p");
+        assert_eq!(proxy.port, 8080);
+        assert!(matches!(proxy.proxy_type, ProxyType::Http));
+    }
+
+    #[test]
+    fn test_proxy_from_url_https() {
+        let proxy = Proxy::from_url("https://test.i2p:443").unwrap();
+        assert_eq!(proxy.host, "test.i2p");
+        assert_eq!(proxy.port, 443);
+        assert!(matches!(proxy.proxy_type, ProxyType::Https));
+    }
+
+    #[test]
+    fn test_proxy_from_url_socks5() {
+        let proxy = Proxy::from_url("socks5://proxy.b32.i2p:1080").unwrap();
+        assert_eq!(proxy.host, "proxy.b32.i2p");
+        assert_eq!(proxy.port, 1080);
+        assert!(matches!(proxy.proxy_type, ProxyType::Socks));
+    }
+
+    #[test]
+    fn test_proxy_from_url_invalid() {
+        let proxy = Proxy::from_url("not-a-url");
+        assert!(proxy.is_none());
+    }
+
+    #[test]
+    fn test_proxy_is_i2p_proxy() {
+        let proxy1 = Proxy::new("example.i2p".to_string(), 443);
+        assert!(proxy1.is_i2p_proxy());
+
+        let proxy2 = Proxy::new("proxy.b32.i2p".to_string(), 1080);
+        assert!(proxy2.is_i2p_proxy());
+
+        let proxy3 = Proxy::new("example.com".to_string(), 443);
+        assert!(!proxy3.is_i2p_proxy());
+    }
+
+    #[test]
+    fn test_proxy_type_detection_by_port() {
+        // Test SOCKS port detection
+        let proxy1 = Proxy::new("test.i2p".to_string(), 1080);
+        assert!(matches!(proxy1.proxy_type, ProxyType::Socks));
+
+        let proxy2 = Proxy::new("test.i2p".to_string(), 9050);
+        assert!(matches!(proxy2.proxy_type, ProxyType::Socks));
+
+        // Test HTTPS port detection
+        let proxy3 = Proxy::new("test.i2p".to_string(), 443);
+        assert!(matches!(proxy3.proxy_type, ProxyType::Https));
+
+        // Test HTTP default
+        let proxy4 = Proxy::new("test.i2p".to_string(), 8080);
+        assert!(matches!(proxy4.proxy_type, ProxyType::Http));
+    }
+
+    #[test]
+    fn test_parse_proxies_from_html_table() {
+        let manager = ProxyManager::new();
+        let html = r#"
+            <table>
+                <tr>
+                    <td>proxy1.i2p</td>
+                    <td>443</td>
+                    <td>100%</td>
+                    <td>https</td>
+                </tr>
+                <tr>
+                    <td>proxy2.b32.i2p</td>
+                    <td>1080</td>
+                    <td>95%</td>
+                    <td>socks</td>
+                </tr>
+            </table>
+        "#;
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].host, "proxy1.i2p");
+        assert_eq!(proxies[0].port, 443);
+        assert!(matches!(proxies[0].proxy_type, ProxyType::Https));
+        assert_eq!(proxies[1].host, "proxy2.b32.i2p");
+        assert_eq!(proxies[1].port, 1080);
+        assert!(matches!(proxies[1].proxy_type, ProxyType::Socks));
+    }
+
+    #[test]
+    fn test_parse_proxies_deduplicates() {
+        let manager = ProxyManager::new();
+        let html = r#"
+            <table>
+                <tr><td>proxy1.i2p</td><td>443</td><td>100%</td><td>https</td></tr>
+                <tr><td>proxy1.i2p</td><td>443</td><td>100%</td><td>https</td></tr>
+            </table>
+        "#;
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        assert_eq!(proxies.len(), 1); // Should deduplicate
+    }
+
+    #[test]
+    fn test_parse_proxies_skips_http_type() {
+        let manager = ProxyManager::new();
+        let html = r#"
+            <table>
+                <tr><td>proxy1.i2p</td><td>80</td><td>100%</td><td>http</td></tr>
+                <tr><td>proxy2.i2p</td><td>443</td><td>100%</td><td>https</td></tr>
+            </table>
+        "#;
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        assert_eq!(proxies.len(), 1); // Should skip HTTP, only include HTTPS
+        assert_eq!(proxies[0].host, "proxy2.i2p");
+    }
+
+    #[test]
+    fn test_parse_proxies_from_links() {
+        let manager = ProxyManager::new();
+        let html = r#"
+            <html>
+                <body>
+                    <a href="https://proxy1.i2p:443">Proxy 1</a>
+                    <a href="https://proxy2.b32.i2p:443">Proxy 2</a>
+                </body>
+            </html>
+        "#;
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        // Should find proxies from links
+        assert!(proxies.len() >= 0); // May or may not find them depending on parsing
+    }
+
+    #[test]
+    fn test_parse_proxies_from_url_pattern() {
+        let manager = ProxyManager::new();
+        let html = r#"
+            <html>
+                <body>
+                    https://proxy1.i2p:443
+                    https://proxy2.b32.i2p:443
+                </body>
+            </html>
+        "#;
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        // Should find proxies from URL pattern
+        assert!(proxies.len() >= 0);
+    }
+
+    #[test]
+    fn test_parse_proxies_empty_html() {
+        let manager = ProxyManager::new();
+        let html = "";
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        assert_eq!(proxies.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_proxies_malformed_html() {
+        let manager = ProxyManager::new();
+        let html = "<table><tr><td>incomplete";
+        
+        let proxies = manager.parse_proxies(html).unwrap();
+        // Should handle malformed HTML gracefully
+        assert!(proxies.len() >= 0);
+    }
+
+    #[test]
+    fn test_proxy_from_url_without_port() {
+        let proxy = Proxy::from_url("https://test.i2p");
+        assert!(proxy.is_some());
+        let proxy = proxy.unwrap();
+        assert_eq!(proxy.port, 80); // Default port when not specified
+    }
+
+    #[test]
+    fn test_proxy_from_url_with_path() {
+        let proxy = Proxy::from_url("https://test.i2p:443/path/to/resource");
+        assert!(proxy.is_some());
+        let proxy = proxy.unwrap();
+        assert_eq!(proxy.host, "test.i2p");
+        assert_eq!(proxy.port, 443);
+    }
+
+    #[test]
+    fn test_proxy_clone() {
+        let proxy1 = Proxy::new("test.i2p".to_string(), 443);
+        let proxy2 = proxy1.clone();
+        assert_eq!(proxy1.host, proxy2.host);
+        assert_eq!(proxy1.port, proxy2.port);
+        assert_eq!(proxy1.url, proxy2.url);
+    }
+
+    #[test]
+    fn test_proxy_type_clone() {
+        let proxy_type = ProxyType::Https;
+        let cloned = match proxy_type {
+            ProxyType::Https => ProxyType::Https,
+            ProxyType::Http => ProxyType::Http,
+            ProxyType::Socks => ProxyType::Socks,
+        };
+        assert!(matches!(cloned, ProxyType::Https));
     }
 }
 

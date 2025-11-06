@@ -59,16 +59,20 @@ class I2PStreamingResponse(requests.Response):
     """Streaming Response class that mimics requests.Response with streaming support"""
     
     def __init__(self, status_code: int, headers: Dict[str, str], url: str, daemon, request_info: Dict):
-        super().__init__()
+        # Don't call super().__init__() as it tries to set raw=None
+        # Instead, set attributes manually
         self.status_code = status_code
         self.url = url
         self.reason = self._get_reason(status_code)
         self.headers = requests.structures.CaseInsensitiveDict(headers)
         self.encoding = 'utf-8'
+        self._content = None  # Will be None for streaming
+        self._content_consumed = False
         self._daemon = daemon
         self._request_info = request_info
         self._stream_started = False
         self._chunk_iterator = None
+        self._raw = None  # Store raw stream reference
     
     def _get_reason(self, status_code: int) -> str:
         """Get HTTP reason phrase from status code"""
