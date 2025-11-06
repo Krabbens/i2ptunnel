@@ -1,6 +1,76 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Find OpenSSL include directories
+fn find_openssl_includes() -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    
+    // Try environment variables first
+    if let Ok(openssl_dir) = env::var("OPENSSL_DIR") {
+        let include_dir = PathBuf::from(&openssl_dir).join("include");
+        if include_dir.exists() {
+            includes.push(include_dir);
+        }
+    }
+    
+    if let Ok(openssl_include) = env::var("OPENSSL_INCLUDE_DIR") {
+        let include_dir = PathBuf::from(&openssl_include);
+        if include_dir.exists() {
+            includes.push(include_dir);
+        }
+    }
+    
+    // On Windows with MinGW, try common locations
+    if cfg!(target_os = "windows") {
+        // Try to infer from compiler path (e.g., C:/ProgramData/mingw64/mingw64)
+        if let Ok(cc) = env::var("CC") {
+            if let Some(mingw_base) = PathBuf::from(&cc).parent().and_then(|p| p.parent()) {
+                let include_dir = mingw_base.join("include");
+                if include_dir.exists() {
+                    includes.push(include_dir);
+                }
+            }
+        }
+        
+        // Common MinGW/MSYS2 locations
+        let common_paths = vec![
+            "C:/msys64/mingw64/include",
+            "C:/msys64/usr/include",
+            "C:/ProgramData/mingw64/mingw64/include",
+            "C:/mingw64/include",
+        ];
+        
+        for path_str in common_paths {
+            let path = PathBuf::from(path_str);
+            if path.exists() && !includes.contains(&path) {
+                includes.push(path);
+            }
+        }
+    }
+    
+    // On Unix-like systems, try pkg-config
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("pkg-config")
+            .args(&["--cflags-only-I", "openssl"])
+            .output()
+        {
+            if let Ok(cflags) = String::from_utf8(output.stdout) {
+                for flag in cflags.split_whitespace() {
+                    if flag.starts_with("-I") {
+                        let include_dir = PathBuf::from(&flag[2..]);
+                        if include_dir.exists() && !includes.contains(&include_dir) {
+                            includes.push(include_dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    includes
+}
+
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
 
@@ -56,6 +126,9 @@ fn main() {
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=z");
     
+    // Find OpenSSL include directories
+    let openssl_includes = find_openssl_includes();
+    
     // Compile the C++ wrapper
     let mut cpp_build = cc::Build::new();
     cpp_build
@@ -65,7 +138,14 @@ fn main() {
         .include(&i2pd_dir.join("libi2pd"))
         .include(&i2pd_dir.join("libi2pd_client"))
         .include(&i2pd_dir.join("libi2pd_wrapper"))
-        .include(&i2pd_dir.join("i18n"))  // For I18N_langs.h
+        .include(&i2pd_dir.join("i18n"));  // For I18N_langs.h
+    
+    // Add OpenSSL include directories
+    for include_dir in &openssl_includes {
+        cpp_build.include(include_dir);
+    }
+    
+    cpp_build
         .flag("-std=c++17")
         .compile("i2pd_wrapper");
     
@@ -78,12 +158,19 @@ fn main() {
     let i2pd_wrapper_include = i2pd_dir.join("libi2pd_wrapper");
     let _i2pd_api_include = i2pd_dir.join("libi2pd/api.h");
     
-    let bindings = bindgen::Builder::default()
+    let mut bindgen_builder = bindgen::Builder::default()
         .header(i2pd_wrapper_header.to_str().unwrap())
         .clang_arg(format!("-I{}", i2pd_dir.display()))  // Add i2pd root for includes
         .clang_arg(format!("-I{}", i2pd_include.display()))
         .clang_arg(format!("-I{}", i2pd_client_include.display()))
-        .clang_arg(format!("-I{}", i2pd_wrapper_include.display()))
+        .clang_arg(format!("-I{}", i2pd_wrapper_include.display()));
+    
+    // Add OpenSSL include directories to bindgen
+    for include_dir in &openssl_includes {
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", include_dir.display()));
+    }
+    
+    let bindings = bindgen_builder
         .allowlist_function("i2pd_.*")
         .allowlist_type("i2pd_.*")
         .generate()
