@@ -29,7 +29,7 @@ futures = "0.3"
 
 [build-dependencies]
 pyo3-build-config = "0.21"
-bindgen = "0.69"
+bindgen = "0.68"
 cc = "1.0"
 cmake = "0.1"
 num_cpus = "1.16"
