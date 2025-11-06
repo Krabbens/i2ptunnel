@@ -399,7 +399,7 @@ impl RequestHandler {
         };
         
         // Use helper to create client and send request
-        let (response, proxy_used, is_i2p_result) = self.create_client_and_send_request(&config, proxy_candidates).await?;
+        let (response, proxy_used, _is_i2p) = self.create_client_and_send_request(&config, proxy_candidates).await?;
 
         let status = response.status().as_u16();
         info!("Received response: status {}", status);
