@@ -71,6 +71,55 @@ impl ProxySelector {
         Some(selected)
     }
 
+    pub async fn select_fastest_multiple(
+        &self,
+        test_results: Vec<ProxyTestResult>,
+        count: usize,
+    ) -> Vec<SelectedProxy> {
+        info!("Selecting top {} fastest proxies from {} results", count, test_results.len());
+
+        let mut successful_results: Vec<&ProxyTestResult> = test_results
+            .iter()
+            .filter(|r| r.success)
+            .collect();
+
+        if successful_results.is_empty() {
+            warn!("No successful proxy tests found");
+            return Vec::new();
+        }
+
+        // Sort by speed (descending)
+        successful_results.sort_by(|a, b| {
+            b.speed_bytes_per_sec
+                .partial_cmp(&a.speed_bytes_per_sec)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Take top N
+        let selected: Vec<SelectedProxy> = successful_results
+            .iter()
+            .take(count)
+            .map(|result| SelectedProxy {
+                proxy: result.proxy.clone(),
+                speed_bytes_per_sec: result.speed_bytes_per_sec,
+                selected_at: Instant::now(),
+            })
+            .collect();
+
+        if !selected.is_empty() {
+            info!(
+                "Selected top {} proxies, fastest: {} ({:.2} KB/s)",
+                selected.len(),
+                selected[0].proxy.url,
+                selected[0].speed_bytes_per_sec / 1024.0
+            );
+            // Cache the fastest one
+            *self.current_proxy.write() = Some(selected[0].clone());
+        }
+
+        selected
+    }
+
     pub fn get_current_proxy(&self) -> Option<SelectedProxy> {
         self.current_proxy.read().as_ref().cloned()
     }
@@ -110,6 +159,51 @@ impl ProxySelector {
 
             Ok(self.select_fastest(test_results).await)
         }
+    }
+
+    pub async fn ensure_multiple_proxy_candidates(
+        &self,
+        available_proxies: Vec<Proxy>,
+        count: usize,
+    ) -> Result<Vec<SelectedProxy>, Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let last_retest_time = *self.last_retest.read();
+
+        // Check if we need to retest
+        if now.duration_since(last_retest_time) >= self.retest_interval {
+            info!("Retest interval reached, testing proxies again");
+            *self.last_retest.write() = now;
+
+            let max_concurrent = (available_proxies.len().min(10)).max(1);
+            let test_results = self
+                .tester
+                .test_proxies_parallel(available_proxies, max_concurrent)
+                .await;
+
+            return Ok(self.select_fastest_multiple(test_results, count).await);
+        }
+
+        // If we have a current proxy, try to return it plus get more if needed
+        let current_proxy = self.get_current_proxy();
+        if let Some(proxy) = current_proxy {
+            debug!("Using cached fastest proxy: {}", proxy.proxy.url);
+            // If we only need one, return just this
+            if count == 1 {
+                return Ok(vec![proxy]);
+            }
+            // Otherwise, we should test to get multiple candidates
+            // But for efficiency, return current + test for more
+        }
+
+        // Test to get multiple candidates
+        warn!("Testing proxies to get {} candidates", count);
+        let max_concurrent = (available_proxies.len().min(10)).max(1);
+        let test_results = self
+            .tester
+            .test_proxies_parallel(available_proxies, max_concurrent)
+            .await;
+
+        Ok(self.select_fastest_multiple(test_results, count).await)
     }
 
     pub async fn handle_proxy_failure(&self, failed_proxy: &Proxy) {

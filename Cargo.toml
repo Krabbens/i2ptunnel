@@ -1,6 +1,6 @@
 [package]
 name = "i2ptunnel"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "I2P Proxy Tunnel with Python decorator support"
 license = "MIT"

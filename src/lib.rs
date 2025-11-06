@@ -183,6 +183,7 @@ impl I2PProxyDaemon {
         }
     }
 
+    #[pyo3(signature = (url, method, *, headers=None, body=None, chunk_size=8192))]
     fn make_request_streaming(
         &self,
         url: &str,
@@ -231,7 +232,7 @@ impl I2PProxyDaemon {
         }
 
         // Make the request and get response
-        let (response, proxy_used, _) = match rt.block_on(async move {
+        let (mut response, proxy_used, _) = match rt.block_on(async move {
             handler.create_client_and_send_request(&request_config, proxies).await
         }) {
             Ok(result) => result,
