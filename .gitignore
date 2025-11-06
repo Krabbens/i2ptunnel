@@ -107,3 +107,18 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# i2pd build artifacts
+vendor/i2pd/build/
+vendor/i2pd/Win32/
+vendor/i2pd/*.a
+vendor/i2pd/*.lib
+vendor/i2pd/*.dll
+vendor/i2pd/*.so
+vendor/i2pd/*.dylib
+vendor/i2pd/CMakeCache.txt
+vendor/i2pd/CMakeFiles/
+vendor/i2pd/cmake_install.cmake
+vendor/i2pd/Makefile
+vendor/i2pd/*.o
+vendor/i2pd/*.obj
+

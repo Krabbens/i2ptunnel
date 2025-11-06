@@ -230,4 +230,181 @@ impl Default for ProxySelector {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy_tester::ProxyTestResult;
+
+    #[tokio::test]
+    async fn test_select_fastest_from_results() {
+        let selector = ProxySelector::new(300);
+        
+        let proxy1 = Proxy::new("proxy1.i2p".to_string(), 443);
+        let proxy2 = Proxy::new("proxy2.i2p".to_string(), 443);
+        let proxy3 = Proxy::new("proxy3.i2p".to_string(), 443);
+        
+        let results = vec![
+            ProxyTestResult::succeeded(proxy1.clone(), 1000.0, 100.0),
+            ProxyTestResult::succeeded(proxy2.clone(), 5000.0, 50.0), // Fastest
+            ProxyTestResult::succeeded(proxy3.clone(), 2000.0, 150.0),
+        ];
+        
+        let selected = selector.select_fastest(results).await;
+        assert!(selected.is_some());
+        let selected = selected.unwrap();
+        assert_eq!(selected.proxy.url, proxy2.url);
+        assert_eq!(selected.speed_bytes_per_sec, 5000.0);
+    }
+
+    #[tokio::test]
+    async fn test_select_fastest_no_successful() {
+        let selector = ProxySelector::new(300);
+        
+        let proxy1 = Proxy::new("proxy1.i2p".to_string(), 443);
+        let results = vec![
+            ProxyTestResult::failed(proxy1.clone(), "Connection failed".to_string()),
+        ];
+        
+        let selected = selector.select_fastest(results).await;
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_select_fastest_multiple() {
+        let selector = ProxySelector::new(300);
+        
+        let proxy1 = Proxy::new("proxy1.i2p".to_string(), 443);
+        let proxy2 = Proxy::new("proxy2.i2p".to_string(), 443);
+        let proxy3 = Proxy::new("proxy3.i2p".to_string(), 443);
+        let proxy4 = Proxy::new("proxy4.i2p".to_string(), 443);
+        
+        let results = vec![
+            ProxyTestResult::succeeded(proxy1.clone(), 1000.0, 100.0),
+            ProxyTestResult::succeeded(proxy2.clone(), 5000.0, 50.0), // Fastest
+            ProxyTestResult::succeeded(proxy3.clone(), 2000.0, 150.0),
+            ProxyTestResult::succeeded(proxy4.clone(), 3000.0, 120.0),
+        ];
+        
+        let selected = selector.select_fastest_multiple(results, 3).await;
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].proxy.url, proxy2.url); // Should be sorted by speed
+        assert_eq!(selected[0].speed_bytes_per_sec, 5000.0);
+        assert_eq!(selected[1].speed_bytes_per_sec, 3000.0);
+        assert_eq!(selected[2].speed_bytes_per_sec, 2000.0);
+    }
+
+    #[test]
+    fn test_get_current_proxy() {
+        let selector = ProxySelector::new(300);
+        assert!(selector.get_current_proxy().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_proxy_failure() {
+        let selector = ProxySelector::new(300);
+        
+        let proxy1 = Proxy::new("proxy1.i2p".to_string(), 443);
+        let proxy2 = Proxy::new("proxy2.i2p".to_string(), 443);
+        
+        // Select a proxy first
+        let results = vec![
+            ProxyTestResult::succeeded(proxy1.clone(), 1000.0, 100.0),
+        ];
+        selector.select_fastest(results).await;
+        
+        assert!(selector.get_current_proxy().is_some());
+        
+        // Handle failure of current proxy
+        selector.handle_proxy_failure(&proxy1).await;
+        
+        assert!(selector.get_current_proxy().is_none());
+        
+        // Handle failure of non-current proxy (should not affect current)
+        let results = vec![
+            ProxyTestResult::succeeded(proxy2.clone(), 2000.0, 100.0),
+        ];
+        selector.select_fastest(results).await;
+        assert!(selector.get_current_proxy().is_some());
+        
+        selector.handle_proxy_failure(&proxy1).await; // Different proxy
+        assert!(selector.get_current_proxy().is_some()); // Should still have current
+    }
+
+    #[tokio::test]
+    async fn test_select_fastest_empty_results() {
+        let selector = ProxySelector::new(300);
+        let results = vec![];
+        
+        let selected = selector.select_fastest(results).await;
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_select_fastest_multiple_empty_results() {
+        let selector = ProxySelector::new(300);
+        let results = vec![];
+        
+        let selected = selector.select_fastest_multiple(results, 5).await;
+        assert_eq!(selected.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_select_fastest_multiple_request_more_than_available() {
+        let selector = ProxySelector::new(300);
+        
+        let proxy1 = Proxy::new("proxy1.i2p".to_string(), 443);
+        let proxy2 = Proxy::new("proxy2.i2p".to_string(), 443);
+        
+        let results = vec![
+            ProxyTestResult::succeeded(proxy1.clone(), 1000.0, 100.0),
+            ProxyTestResult::succeeded(proxy2.clone(), 2000.0, 100.0),
+        ];
+        
+        let selected = selector.select_fastest_multiple(results, 10).await;
+        // Should return only available proxies
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_fastest_proxy_with_empty_list() {
+        let selector = ProxySelector::new(300);
+        let proxies = vec![];
+        
+        let result = selector.ensure_fastest_proxy(proxies).await;
+        // Should handle empty list gracefully
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_multiple_proxy_candidates_with_empty_list() {
+        let selector = ProxySelector::new(300);
+        let proxies = vec![];
+        
+        let result = selector.ensure_multiple_proxy_candidates(proxies, 5).await;
+        // Should handle empty list gracefully
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_selected_proxy_clone() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let selected = SelectedProxy {
+            proxy: proxy.clone(),
+            speed_bytes_per_sec: 1000.0,
+            selected_at: std::time::Instant::now(),
+        };
+        
+        let cloned = selected.clone();
+        assert_eq!(selected.proxy.url, cloned.proxy.url);
+        assert_eq!(selected.speed_bytes_per_sec, cloned.speed_bytes_per_sec);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_selector_default() {
+        let selector = ProxySelector::default();
+        assert!(selector.get_current_proxy().is_none());
+    }
+}
+
 

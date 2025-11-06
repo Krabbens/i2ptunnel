@@ -103,17 +103,48 @@ impl ProxyTester {
         // Create client with proxy based on proxy type
         let client = match &proxy.proxy_type {
             crate::proxy_manager::ProxyType::Socks => {
-                // For SOCKS proxies, use SOCKS5 support
+                // For SOCKS proxies, try SOCKS5 first, fallback to HTTPS if SOCKS fails
                 let socks_url = format!("socks5://{}:{}", proxy.host, proxy.port);
-                reqwest::Proxy::all(&socks_url)
-                    .map_err(|e| format!("Failed to create SOCKS proxy: {}", e))
-                    .and_then(|p| {
-                        Client::builder()
-                            .proxy(p)
+                let https_url = format!("https://{}:{}", proxy.host, proxy.port);
+                
+                // Try SOCKS first
+                match reqwest::Proxy::all(&socks_url) {
+                    Ok(socks_proxy) => {
+                        match Client::builder()
+                            .proxy(socks_proxy)
                             .timeout(self.test_timeout)
                             .build()
-                            .map_err(|e| format!("Failed to create client: {}", e))
-                    })
+                        {
+                            Ok(client) => Ok(client),
+                            Err(e) => {
+                                warn!("SOCKS proxy {} failed to create client, falling back to HTTPS: {}", proxy.url, e);
+                                // Fallback to HTTPS
+                                reqwest::Proxy::https(&https_url)
+                                    .map_err(|e| format!("Failed to create HTTPS fallback proxy: {}", e))
+                                    .and_then(|p| {
+                                        Client::builder()
+                                            .proxy(p)
+                                            .timeout(self.test_timeout)
+                                            .build()
+                                            .map_err(|e| format!("Failed to create HTTPS fallback client: {}", e))
+                                    })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("SOCKS proxy {} not available, falling back to HTTPS: {}", proxy.url, e);
+                        // Fallback to HTTPS
+                        reqwest::Proxy::https(&https_url)
+                            .map_err(|e| format!("Failed to create HTTPS fallback proxy: {}", e))
+                            .and_then(|p| {
+                                Client::builder()
+                                    .proxy(p)
+                                    .timeout(self.test_timeout)
+                                    .build()
+                                    .map_err(|e| format!("Failed to create HTTPS fallback client: {}", e))
+                            })
+                    }
+                }
             }
             crate::proxy_manager::ProxyType::Https => {
                 // For HTTPS proxies, use https proxy
@@ -263,6 +294,146 @@ impl ProxyTester {
 impl Default for ProxyTester {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_test_result_new() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let result = ProxyTestResult::new(proxy.clone());
+        
+        assert_eq!(result.proxy.url, proxy.url);
+        assert_eq!(result.speed_bytes_per_sec, 0.0);
+        assert_eq!(result.latency_ms, 0.0);
+        assert!(!result.success);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_proxy_test_result_succeeded() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let result = ProxyTestResult::succeeded(proxy.clone(), 5000.0, 100.0);
+        
+        assert_eq!(result.proxy.url, proxy.url);
+        assert_eq!(result.speed_bytes_per_sec, 5000.0);
+        assert_eq!(result.latency_ms, 100.0);
+        assert!(result.success);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_proxy_test_result_failed() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let error_msg = "Connection timeout".to_string();
+        let result = ProxyTestResult::failed(proxy.clone(), error_msg.clone());
+        
+        assert_eq!(result.proxy.url, proxy.url);
+        assert_eq!(result.speed_bytes_per_sec, 0.0);
+        assert_eq!(result.latency_ms, 0.0);
+        assert!(!result.success);
+        assert_eq!(result.error, Some(error_msg));
+    }
+
+    #[tokio::test]
+    async fn test_i2p_proxy_skips_test() {
+        let tester = ProxyTester::new(None);
+        let proxy = Proxy::new("proxy.b32.i2p".to_string(), 443);
+        
+        assert!(proxy.is_i2p_proxy());
+        
+        let result = tester.test_proxy(&proxy).await;
+        
+        // I2P proxies should be marked as successful with default values
+        assert!(result.success);
+        assert_eq!(result.speed_bytes_per_sec, 1024.0 * 50.0); // 50 KB/s default
+        assert_eq!(result.latency_ms, 200.0); // 200ms default
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_proxy_tester_new() {
+        let tester = ProxyTester::new(None);
+        assert_eq!(tester.test_url, "http://httpbin.org/bytes/10240");
+        assert_eq!(tester.test_timeout, Duration::from_secs(10));
+        assert_eq!(tester.test_size_bytes, 10240);
+    }
+
+    #[test]
+    fn test_proxy_tester_custom_url() {
+        let custom_url = "http://example.com/test".to_string();
+        let tester = ProxyTester::new(Some(custom_url.clone()));
+        assert_eq!(tester.test_url, custom_url);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_tester_empty_list() {
+        let tester = ProxyTester::new(None);
+        let proxies = vec![];
+        
+        let results = tester.test_proxies_parallel(proxies, 5).await;
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_tester_single_proxy() {
+        let tester = ProxyTester::new(None);
+        let proxy = Proxy::new("test.b32.i2p".to_string(), 443);
+        
+        let results = tester.test_proxies_parallel(vec![proxy], 1).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success); // I2P proxy should be marked successful
+    }
+
+    #[test]
+    fn test_proxy_test_result_clone() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let result = ProxyTestResult::succeeded(proxy.clone(), 5000.0, 100.0);
+        
+        let cloned = result.clone();
+        assert_eq!(result.proxy.url, cloned.proxy.url);
+        assert_eq!(result.speed_bytes_per_sec, cloned.speed_bytes_per_sec);
+        assert_eq!(result.latency_ms, cloned.latency_ms);
+        assert_eq!(result.success, cloned.success);
+    }
+
+    #[test]
+    fn test_proxy_test_result_with_error() {
+        let proxy = Proxy::new("test.i2p".to_string(), 443);
+        let error = "Test error".to_string();
+        let result = ProxyTestResult::failed(proxy.clone(), error.clone());
+        
+        assert!(!result.success);
+        assert_eq!(result.error, Some(error));
+        assert_eq!(result.speed_bytes_per_sec, 0.0);
+        assert_eq!(result.latency_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_tester_multiple_i2p_proxies() {
+        let tester = ProxyTester::new(None);
+        let proxies = vec![
+            Proxy::new("proxy1.b32.i2p".to_string(), 443),
+            Proxy::new("proxy2.b32.i2p".to_string(), 1080),
+            Proxy::new("proxy3.i2p".to_string(), 443),
+        ];
+        
+        let results = tester.test_proxies_parallel(proxies, 3).await;
+        assert_eq!(results.len(), 3);
+        // All I2P proxies should be marked as successful
+        for result in &results {
+            assert!(result.success);
+            assert!(result.proxy.is_i2p_proxy());
+        }
+    }
+
+    #[test]
+    fn test_proxy_tester_default() {
+        let tester = ProxyTester::default();
+        assert_eq!(tester.test_url, "http://httpbin.org/bytes/10240");
     }
 }
 
