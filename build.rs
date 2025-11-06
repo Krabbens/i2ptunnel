@@ -6,14 +6,13 @@ fn main() {
 
     // Get the i2pd vendor directory
     let i2pd_dir = PathBuf::from("vendor/i2pd");
-    let i2pd_build_dir = PathBuf::from("vendor/i2pd/build");
     
     if !i2pd_dir.exists() {
         panic!("i2pd submodule not found. Please run: git submodule update --init --recursive");
     }
 
-    // Configure CMake build for i2pd
-    let mut cmake_config = cmake::Config::new(&i2pd_build_dir);
+    // Configure CMake build for i2pd (source directory, not build directory)
+    let mut cmake_config = cmake::Config::new(&i2pd_dir);
     
     // Set CMake options
     cmake_config
@@ -41,11 +40,17 @@ fn main() {
         println!("cargo:rustc-link-lib=wsock32");
         println!("cargo:rustc-link-lib=ws2_32");
         println!("cargo:rustc-link-lib=iphlpapi");
+        // On Windows, Boost libraries built with MSVC typically have -mt suffix
+        // The linker will automatically add 'lib' prefix, so we don't include it
+        println!("cargo:rustc-link-lib=static=boost_filesystem-mt");
+        println!("cargo:rustc-link-lib=static=boost_program_options-mt");
+    } else {
+        // On Unix-like systems, use standard names
+        println!("cargo:rustc-link-lib=boost_filesystem");
+        println!("cargo:rustc-link-lib=boost_program_options");
     }
     
-    // Link against Boost and OpenSSL (these should be found by CMake)
-    println!("cargo:rustc-link-lib=boost_filesystem");
-    println!("cargo:rustc-link-lib=boost_program_options");
+    // Link against OpenSSL and zlib (these should be found by CMake)
     println!("cargo:rustc-link-lib=ssl");
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=z");
@@ -58,8 +63,19 @@ fn main() {
         .include(&i2pd_dir.join("libi2pd"))
         .include(&i2pd_dir.join("libi2pd_client"))
         .include(&i2pd_dir.join("libi2pd_wrapper"))
-        .flag("-std=c++17")
-        .compile("i2pd_wrapper");
+        .flag("-std=c++17");
+    
+    // Add library search paths for the C++ linker (Unix-like systems use -L, Windows uses /LIBPATH:)
+    if !cfg!(target_os = "windows") {
+        cpp_build.flag(&format!("-L{}/lib", i2pd_dst.display()));
+        cpp_build.flag(&format!("-L{}/lib64", i2pd_dst.display()));
+    } else {
+        // Windows MSVC uses /LIBPATH: flag
+        cpp_build.flag(&format!("/LIBPATH:{}\\lib", i2pd_dst.display()));
+        cpp_build.flag(&format!("/LIBPATH:{}\\lib64", i2pd_dst.display()));
+    }
+    
+    cpp_build.compile("i2pd_wrapper");
     
     println!("cargo:rustc-link-lib=static=i2pd_wrapper");
     
