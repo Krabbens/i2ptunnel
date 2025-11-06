@@ -2,6 +2,8 @@
 #ifndef I2PD_WRAPPER_H__
 #define I2PD_WRAPPER_H__
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
