@@ -6,13 +6,18 @@ fn main() {
 
     // Get the i2pd vendor directory
     let i2pd_dir = PathBuf::from("vendor/i2pd");
-    let i2pd_build_dir = PathBuf::from("vendor/i2pd/build");
+    let i2pd_build_dir = i2pd_dir.join("build");
     
     if !i2pd_dir.exists() {
         panic!("i2pd submodule not found. Please run: git submodule update --init --recursive");
     }
+    
+    if !i2pd_build_dir.exists() {
+        panic!("i2pd build directory not found. Expected: {}", i2pd_build_dir.display());
+    }
 
     // Configure CMake build for i2pd
+    // CMakeLists.txt is in vendor/i2pd/build/, and it expects source in parent directory
     let mut cmake_config = cmake::Config::new(&i2pd_build_dir);
     
     // Set CMake options
@@ -21,7 +26,8 @@ fn main() {
         .define("WITH_BINARY", "OFF")  // We only need the library
         .define("WITH_STATIC", "ON")   // Build static libraries
         .define("WITH_UPNP", "OFF")    // Disable UPnP for simplicity
-        .build_arg("--parallel")
+        // Help CMake find Boost
+        .define("Boost_NO_BOOST_CMAKE", "ON")
         .build_arg(format!("-j{}", num_cpus::get()));
 
     // Build i2pd libraries
@@ -55,9 +61,11 @@ fn main() {
     cpp_build
         .cpp(true)
         .file("vendor/i2pd_wrapper.cpp")
+        .include(&i2pd_dir)  // Add i2pd root so "libi2pd_wrapper/capi.h" resolves correctly
         .include(&i2pd_dir.join("libi2pd"))
         .include(&i2pd_dir.join("libi2pd_client"))
         .include(&i2pd_dir.join("libi2pd_wrapper"))
+        .include(&i2pd_dir.join("i18n"))  // For I18N_langs.h
         .flag("-std=c++17")
         .compile("i2pd_wrapper");
     
@@ -68,10 +76,11 @@ fn main() {
     let i2pd_include = i2pd_dir.join("libi2pd");
     let i2pd_client_include = i2pd_dir.join("libi2pd_client");
     let i2pd_wrapper_include = i2pd_dir.join("libi2pd_wrapper");
-    let i2pd_api_include = i2pd_dir.join("libi2pd/api.h");
+    let _i2pd_api_include = i2pd_dir.join("libi2pd/api.h");
     
     let bindings = bindgen::Builder::default()
         .header(i2pd_wrapper_header.to_str().unwrap())
+        .clang_arg(format!("-I{}", i2pd_dir.display()))  // Add i2pd root for includes
         .clang_arg(format!("-I{}", i2pd_include.display()))
         .clang_arg(format!("-I{}", i2pd_client_include.display()))
         .clang_arg(format!("-I{}", i2pd_wrapper_include.display()))

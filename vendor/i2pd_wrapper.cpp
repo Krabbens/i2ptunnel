@@ -15,6 +15,10 @@ static std::shared_ptr<i2p::proxy::HTTPProxy> https_proxy;
 
 extern "C" {
 
+// Forward declarations
+void i2pd_http_proxy_stop(void);
+void i2pd_https_proxy_stop(void);
+
 int i2pd_router_init(const char* config_dir) {
     std::lock_guard<std::mutex> lock(router_mutex);
     if (router_initialized) {
