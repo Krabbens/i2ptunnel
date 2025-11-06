@@ -1,6 +1,71 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Find OpenSSL include directory
+fn find_openssl_include_dir() -> Option<PathBuf> {
+    // Check environment variables first
+    if let Ok(openssl_dir) = env::var("OPENSSL_DIR") {
+        let include_path = PathBuf::from(&openssl_dir).join("include");
+        if include_path.exists() {
+            return Some(include_path);
+        }
+    }
+    
+    if let Ok(openssl_root) = env::var("OPENSSL_ROOT_DIR") {
+        let include_path = PathBuf::from(&openssl_root).join("include");
+        if include_path.exists() {
+            return Some(include_path);
+        }
+    }
+    
+    // Check BOOST_ROOT location (OpenSSL is often installed alongside Boost in MSYS2)
+    if let Ok(boost_root) = env::var("BOOST_ROOT") {
+        let include_path = PathBuf::from(&boost_root).join("include");
+        let openssl_header = include_path.join("openssl").join("ssl.h");
+        if openssl_header.exists() {
+            return Some(include_path);
+        }
+    }
+    
+    // On Windows with MinGW/MSYS2, check common locations
+    if cfg!(target_os = "windows") {
+        let common_paths = vec![
+            PathBuf::from("C:/msys64/mingw64/include"),
+            PathBuf::from("C:/msys64/usr/include"),
+            PathBuf::from("C:/mingw64/include"),
+            PathBuf::from("C:/OpenSSL-Win64/include"),
+            PathBuf::from("C:/OpenSSL/include"),
+        ];
+        
+        for path in common_paths {
+            let openssl_header = path.join("openssl").join("ssl.h");
+            if openssl_header.exists() {
+                return Some(path);
+            }
+        }
+    }
+    
+    // On Unix-like systems, check common locations
+    #[cfg(unix)]
+    {
+        let common_paths = vec![
+            PathBuf::from("/usr/include"),
+            PathBuf::from("/usr/local/include"),
+            PathBuf::from("/opt/homebrew/include"),  // macOS Apple Silicon
+            PathBuf::from("/usr/local/opt/openssl/include"),  // macOS Homebrew
+        ];
+        
+        for path in common_paths {
+            let openssl_header = path.join("openssl").join("ssl.h");
+            if openssl_header.exists() {
+                return Some(path);
+            }
+        }
+    }
+    
+    None
+}
+
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
 
@@ -56,6 +121,9 @@ fn main() {
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=z");
     
+    // Find OpenSSL include directory
+    let openssl_include = find_openssl_include_dir();
+    
     // Compile the C++ wrapper
     let mut cpp_build = cc::Build::new();
     cpp_build
@@ -65,7 +133,15 @@ fn main() {
         .include(&i2pd_dir.join("libi2pd"))
         .include(&i2pd_dir.join("libi2pd_client"))
         .include(&i2pd_dir.join("libi2pd_wrapper"))
-        .include(&i2pd_dir.join("i18n"))  // For I18N_langs.h
+        .include(&i2pd_dir.join("i18n"));  // For I18N_langs.h
+    
+    // Add OpenSSL include path if found
+    if let Some(ref openssl_inc) = openssl_include {
+        cpp_build.include(openssl_inc);
+        println!("cargo:warning=Using OpenSSL include path: {}", openssl_inc.display());
+    }
+    
+    cpp_build
         .flag("-std=c++17")
         .compile("i2pd_wrapper");
     
@@ -78,12 +154,19 @@ fn main() {
     let i2pd_wrapper_include = i2pd_dir.join("libi2pd_wrapper");
     let _i2pd_api_include = i2pd_dir.join("libi2pd/api.h");
     
-    let bindings = bindgen::Builder::default()
+    let mut bindgen_builder = bindgen::Builder::default()
         .header(i2pd_wrapper_header.to_str().unwrap())
         .clang_arg(format!("-I{}", i2pd_dir.display()))  // Add i2pd root for includes
         .clang_arg(format!("-I{}", i2pd_include.display()))
         .clang_arg(format!("-I{}", i2pd_client_include.display()))
-        .clang_arg(format!("-I{}", i2pd_wrapper_include.display()))
+        .clang_arg(format!("-I{}", i2pd_wrapper_include.display()));
+    
+    // Add OpenSSL include path to bindgen if found
+    if let Some(ref openssl_inc) = openssl_include {
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", openssl_inc.display()));
+    }
+    
+    let bindings = bindgen_builder
         .allowlist_function("i2pd_.*")
         .allowlist_type("i2pd_.*")
         .generate()
