@@ -196,14 +196,18 @@ impl ProxySelector {
         }
 
         // Test to get multiple candidates
-        warn!("Testing proxies to get {} candidates", count);
+        info!("Testing {} proxies to get {} candidates", available_proxies.len(), count);
         let max_concurrent = (available_proxies.len().min(10)).max(1);
+        info!("Testing proxies in parallel (max_concurrent={})", max_concurrent);
         let test_results = self
             .tester
             .test_proxies_parallel(available_proxies, max_concurrent)
             .await;
-
-        Ok(self.select_fastest_multiple(test_results, count).await)
+        
+        info!("Proxy testing completed: {} results", test_results.len());
+        let selected = self.select_fastest_multiple(test_results, count).await;
+        info!("Selected {} proxy candidates from test results", selected.len());
+        Ok(selected)
     }
 
     pub async fn handle_proxy_failure(&self, failed_proxy: &Proxy) {

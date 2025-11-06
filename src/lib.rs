@@ -236,15 +236,27 @@ impl I2PProxyDaemon {
         let url_clone = request_config.url.clone();
         let is_i2p = crate::request_handler::RequestHandler::is_i2p_domain(&url_clone);
         
+        info!("Getting proxy candidates for {} (is_i2p={}, available_proxies={})", url_clone, is_i2p, available_proxies.len());
+        
         let proxy_candidates = if is_i2p {
             Vec::new() // For I2P sites, we don't need proxy candidates
         } else {
             // Get proxy candidates through the handler
             let handler_for_candidates = handler.clone();
-            rt.block_on(async move {
+            info!("Testing {} proxies to select fastest candidates", available_proxies.len());
+            let result = rt.block_on(async move {
                 handler_for_candidates.get_proxy_candidates_for_request(available_proxies, 5).await
-                    .unwrap_or_default()
-            })
+            });
+            match result {
+                Ok(candidates) => {
+                    info!("Selected {} proxy candidates for streaming request", candidates.len());
+                    candidates
+                }
+                Err(e) => {
+                    warn!("Failed to get proxy candidates: {}, using empty list", e);
+                    Vec::new()
+                }
+            }
         };
 
         // Make the request and get response

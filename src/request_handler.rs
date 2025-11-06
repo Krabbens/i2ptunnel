@@ -258,9 +258,10 @@ impl RequestHandler {
         }
 
         // For clearnet sites, try multiple proxy candidates with retry logic
-        debug!("Clearnet site detected, trying {} proxy candidates", proxy_candidates.len());
+        info!("Clearnet site detected, trying {} proxy candidates", proxy_candidates.len());
         
         if proxy_candidates.is_empty() {
+            error!("No proxy candidates available for clearnet request");
             return Err("No proxy candidates available for clearnet request".to_string());
         }
 
