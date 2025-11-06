@@ -6,14 +6,16 @@ fn main() {
 
     // Get the i2pd vendor directory
     let i2pd_dir = PathBuf::from("vendor/i2pd");
-    let i2pd_build_dir = PathBuf::from("vendor/i2pd/build");
     
     if !i2pd_dir.exists() {
+        eprintln!("ERROR: i2pd submodule not found at {}", i2pd_dir.display());
+        eprintln!("Please run: git submodule update --init --recursive");
+        eprintln!("Or if you don't have the i2pd submodule, you need to initialize it first.");
         panic!("i2pd submodule not found. Please run: git submodule update --init --recursive");
     }
 
-    // Configure CMake build for i2pd
-    let mut cmake_config = cmake::Config::new(&i2pd_build_dir);
+    // Configure CMake build for i2pd (use source directory, not build directory)
+    let mut cmake_config = cmake::Config::new(&i2pd_dir);
     
     // Set CMake options
     cmake_config
@@ -55,9 +57,20 @@ fn main() {
     cpp_build
         .cpp(true)
         .file("vendor/i2pd_wrapper.cpp")
-        .include(&i2pd_dir.join("libi2pd"))
-        .include(&i2pd_dir.join("libi2pd_client"))
-        .include(&i2pd_dir.join("libi2pd_wrapper"))
+        .include(&i2pd_dir.join("libi2pd"));
+    
+    // Add includes that exist
+    let libi2pd_client = i2pd_dir.join("libi2pd_client");
+    if libi2pd_client.exists() {
+        cpp_build.include(&libi2pd_client);
+    }
+    
+    let libi2pd_wrapper = i2pd_dir.join("libi2pd_wrapper");
+    if libi2pd_wrapper.exists() {
+        cpp_build.include(&libi2pd_wrapper);
+    }
+    
+    cpp_build
         .flag("-std=c++17")
         .compile("i2pd_wrapper");
     
@@ -66,15 +79,23 @@ fn main() {
     // Generate Rust bindings using bindgen
     let i2pd_wrapper_header = PathBuf::from("vendor/i2pd_wrapper.h");
     let i2pd_include = i2pd_dir.join("libi2pd");
-    let i2pd_client_include = i2pd_dir.join("libi2pd_client");
-    let i2pd_wrapper_include = i2pd_dir.join("libi2pd_wrapper");
-    let i2pd_api_include = i2pd_dir.join("libi2pd/api.h");
     
-    let bindings = bindgen::Builder::default()
+    let mut bindgen_builder = bindgen::Builder::default()
         .header(i2pd_wrapper_header.to_str().unwrap())
-        .clang_arg(format!("-I{}", i2pd_include.display()))
-        .clang_arg(format!("-I{}", i2pd_client_include.display()))
-        .clang_arg(format!("-I{}", i2pd_wrapper_include.display()))
+        .clang_arg(format!("-I{}", i2pd_include.display()));
+    
+    // Add includes that exist
+    let libi2pd_client = i2pd_dir.join("libi2pd_client");
+    if libi2pd_client.exists() {
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", libi2pd_client.display()));
+    }
+    
+    let libi2pd_wrapper = i2pd_dir.join("libi2pd_wrapper");
+    if libi2pd_wrapper.exists() {
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", libi2pd_wrapper.display()));
+    }
+    
+    let bindings = bindgen_builder
         .allowlist_function("i2pd_.*")
         .allowlist_type("i2pd_.*")
         .generate()
