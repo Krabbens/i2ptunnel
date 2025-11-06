@@ -198,7 +198,7 @@ impl I2PProxyDaemon {
         let manager = self.manager.clone();
 
         // Fetch proxies if needed
-        let proxies = rt.block_on(async move {
+        let available_proxies = rt.block_on(async move {
             manager.fetch_proxies().await.unwrap_or_default()
         });
 
@@ -231,9 +231,25 @@ impl I2PProxyDaemon {
             request_config.body = Some(body_bytes.as_bytes().to_vec());
         }
 
+        // Get proxy candidates using the handler's internal logic
+        // We need to check if it's I2P and get candidates accordingly
+        let url_clone = request_config.url.clone();
+        let is_i2p = crate::request_handler::RequestHandler::is_i2p_domain(&url_clone);
+        
+        let proxy_candidates = if is_i2p {
+            Vec::new() // For I2P sites, we don't need proxy candidates
+        } else {
+            // Get proxy candidates through the handler
+            let handler_for_candidates = handler.clone();
+            rt.block_on(async move {
+                handler_for_candidates.get_proxy_candidates_for_request(available_proxies, 5).await
+                    .unwrap_or_default()
+            })
+        };
+
         // Make the request and get response
         let (mut response, proxy_used, _) = match rt.block_on(async move {
-            handler.create_client_and_send_request(&request_config, proxies).await
+            handler.create_client_and_send_request(&request_config, proxy_candidates).await
         }) {
             Ok(result) => result,
             Err(e) => {

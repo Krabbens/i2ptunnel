@@ -355,6 +355,15 @@ impl RequestHandler {
         Err(error_msg)
     }
 
+    /// Get proxy candidates for a request (public helper method)
+    pub async fn get_proxy_candidates_for_request(
+        &self,
+        available_proxies: Vec<Proxy>,
+        count: usize,
+    ) -> Result<Vec<SelectedProxy>, Box<dyn std::error::Error>> {
+        self.proxy_selector.ensure_multiple_proxy_candidates(available_proxies, count).await
+    }
+
     pub async fn handle_request(
         &self,
         config: RequestConfig,
