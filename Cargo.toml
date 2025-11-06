@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "multipart", "rustls-tls", "socks"] }
+reqwest = { version = "0.11", features = ["json", "multipart", "rustls-tls", "socks"], default-features = false }
 pyo3 = { version = "0.21", features = ["auto-initialize", "extension-module"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "ansi", "json"] }
@@ -33,4 +33,5 @@ bindgen = "0.69"
 cc = "1.0"
 cmake = "0.1"
 num_cpus = "1.16"
+pkg-config = "0.3"
 
