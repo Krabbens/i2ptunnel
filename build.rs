@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::fs;
 
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
@@ -7,9 +8,64 @@ fn main() {
     // Get the i2pd vendor directory
     let i2pd_dir = PathBuf::from("vendor/i2pd");
     let i2pd_build_dir = PathBuf::from("vendor/i2pd/build");
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     
-    if !i2pd_dir.exists() {
-        panic!("i2pd submodule not found. Please run: git submodule update --init --recursive");
+    // Check if i2pd is available (directory exists and is not empty)
+    let i2pd_available = i2pd_dir.exists() && 
+                         i2pd_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
+    
+    if !i2pd_available {
+        println!("cargo:warning=i2pd submodule not found. Building without native i2pd support.");
+        println!("cargo:warning=To enable i2pd support, run: git submodule update --init --recursive");
+        
+        // Generate stub bindings
+        let stub_bindings = r#"// Stub bindings for i2pd (i2pd not available)
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_router_init(_config_dir: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int {
+    -1
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_router_start() -> ::std::os::raw::c_int {
+    -1
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_router_stop() -> ::std::os::raw::c_int {
+    -1
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_router_cleanup() {
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_http_proxy_start(_address: *const ::std::os::raw::c_char, _port: u16) -> ::std::os::raw::c_int {
+    -1
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_https_proxy_start(_address: *const ::std::os::raw::c_char, _port: u16) -> ::std::os::raw::c_int {
+    -1
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_http_proxy_stop() {
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_https_proxy_stop() {
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn i2pd_router_is_running() -> ::std::os::raw::c_int {
+    0
+}
+"#;
+        
+        fs::write(out_path.join("i2pd_bindings.rs"), stub_bindings)
+            .expect("Couldn't write stub bindings!");
+        return;
     }
 
     // Configure CMake build for i2pd
@@ -80,7 +136,6 @@ fn main() {
         .generate()
         .expect("Unable to generate bindings");
     
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("i2pd_bindings.rs"))
         .expect("Couldn't write bindings!");
