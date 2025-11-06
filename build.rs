@@ -6,14 +6,15 @@ fn main() {
 
     // Get the i2pd vendor directory
     let i2pd_dir = PathBuf::from("vendor/i2pd");
-    let i2pd_build_dir = PathBuf::from("vendor/i2pd/build");
     
     if !i2pd_dir.exists() {
         panic!("i2pd submodule not found. Please run: git submodule update --init --recursive");
     }
 
     // Configure CMake build for i2pd
-    let mut cmake_config = cmake::Config::new(&i2pd_build_dir);
+    // CMake source directory should be vendor/i2pd, not vendor/i2pd/build
+    // CMake will create the build directory automatically
+    let mut cmake_config = cmake::Config::new(&i2pd_dir);
     
     // Set CMake options
     cmake_config

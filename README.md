@@ -17,7 +17,7 @@ A Rust daemon with extensive logging that manages I2P HTTPS proxies, tests them 
 
 ### Prerequisites
 
-- Rust (latest stable version)
+- Rust 1.83 or later (required for ICU dependencies)
 - Python 3.8+
 - uv (fast Python package installer)
 - **System Dependencies** (required for building i2pd):
